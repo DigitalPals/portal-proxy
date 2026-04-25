@@ -185,11 +185,12 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) {
 }
 
 struct SshFixture {
-    _root: TempDir,
-    _child: Child,
+    root: TempDir,
+    child: Child,
     user: String,
     port: u16,
     client_key: PathBuf,
+    sshd_log: PathBuf,
 }
 
 impl SshFixture {
@@ -199,18 +200,20 @@ impl SshFixture {
         let client_key = root.path.join("client_ed25519");
         let authorized_keys = root.path.join("authorized_keys");
         run_success(
-            Command::new("ssh-keygen")
+            Command::new(command_path("ssh-keygen"))
                 .arg("-t")
                 .arg("ed25519")
+                .arg("-q")
                 .arg("-N")
                 .arg("")
                 .arg("-f")
                 .arg(&host_key),
         );
         run_success(
-            Command::new("ssh-keygen")
+            Command::new(command_path("ssh-keygen"))
                 .arg("-t")
                 .arg("ed25519")
+                .arg("-q")
                 .arg("-N")
                 .arg("")
                 .arg("-f")
@@ -246,22 +249,24 @@ LogLevel ERROR
             ),
         )?;
 
-        let child = Command::new("sshd")
+        let sshd_log = root.path.join("sshd.log");
+        let child = Command::new(command_path("sshd"))
             .arg("-D")
             .arg("-e")
             .arg("-f")
             .arg(&config)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(fs::File::create(&sshd_log)?)
             .spawn()?;
 
         let fixture = Self {
-            _root: root,
-            _child: child,
+            root,
+            child,
             user,
             port,
             client_key,
+            sshd_log,
         };
         fixture.wait_until_ready();
         Ok(fixture)
@@ -270,7 +275,7 @@ LogLevel ERROR
     fn wait_until_ready(&self) {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(10) {
-            let status = Command::new("ssh")
+            let status = Command::new(command_path("ssh"))
                 .arg("-i")
                 .arg(&self.client_key)
                 .arg("-p")
@@ -292,7 +297,26 @@ LogLevel ERROR
             }
             thread::sleep(Duration::from_millis(100));
         }
-        panic!("sshd fixture did not become ready");
+        let sshd_status = if self.child.id() == 0 {
+            "unknown".to_string()
+        } else {
+            format!("pid {}", self.child.id())
+        };
+        panic!(
+            "sshd fixture did not become ready on port {} ({}); root: {}; sshd log:\n{}",
+            self.port,
+            sshd_status,
+            self.root.path.display(),
+            fs::read_to_string(&self.sshd_log)
+                .unwrap_or_else(|error| format!("failed to read sshd log: {}", error))
+        );
+    }
+}
+
+impl Drop for SshFixture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -316,6 +340,21 @@ fn missing_any(names: &[&str]) -> bool {
             .status()
             .map_or(true, |status| !status.success())
     })
+}
+
+fn command_path(name: &str) -> PathBuf {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {}", name))
+        .output()
+        .unwrap_or_else(|error| panic!("failed to resolve {}: {}", name, error));
+    assert!(
+        output.status.success(),
+        "failed to resolve {}: {}",
+        name,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
 }
 
 struct TempDir {

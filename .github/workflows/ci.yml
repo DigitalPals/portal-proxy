@@ -14,7 +14,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Install integration test dependencies
-        run: sudo apt-get update && sudo apt-get install -y openssh-server dtach util-linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server dtach util-linux
+          sudo mkdir -p /run/sshd
       - name: Format
         run: cargo fmt --check
       - name: Clippy
