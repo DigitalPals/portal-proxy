@@ -101,7 +101,7 @@ sudo install -m 0755 target/release/portal-proxy /usr/local/bin/portal-proxy
 Create a dedicated user and state directory:
 
 ```sh
-sudo useradd --system --create-home --shell /usr/sbin/nologin portal-proxy
+sudo useradd --system --create-home --shell /bin/sh portal-proxy
 sudo install -d -o portal-proxy -g portal-proxy -m 0700 /var/lib/portal-proxy
 sudo install -d -o portal-proxy -g portal-proxy -m 0700 /home/portal-proxy/.ssh
 ```

@@ -69,7 +69,7 @@ reachable from the public internet.
 ## User And State
 
 ```sh
-sudo useradd --system --create-home --shell /usr/sbin/nologin portal-proxy
+sudo useradd --system --create-home --shell /bin/sh portal-proxy
 sudo install -d -o portal-proxy -g portal-proxy -m 0700 /var/lib/portal-proxy
 sudo install -d -o portal-proxy -g portal-proxy -m 0700 /home/portal-proxy/.ssh
 ```

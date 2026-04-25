@@ -114,12 +114,14 @@ install_packages() {
 }
 
 ensure_user_and_dirs() {
-  local shell_path="/usr/sbin/nologin"
-  [ -x "$shell_path" ] || shell_path="/sbin/nologin"
+  local shell_path="/bin/sh"
+  [ -x "$shell_path" ] || shell_path="/usr/bin/sh"
 
   if ! id "$USER_NAME" >/dev/null 2>&1; then
     log "creating dedicated user ${USER_NAME}"
     useradd --system --create-home --shell "$shell_path" "$USER_NAME"
+  else
+    usermod --shell "$shell_path" "$USER_NAME"
   fi
 
   local home_dir
