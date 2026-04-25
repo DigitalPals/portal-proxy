@@ -13,14 +13,56 @@ SSHD_PORT="${PORTAL_PROXY_SSH_PORT:-2222}"
 INSTALL_PRUNE_TIMER="${PORTAL_PROXY_INSTALL_PRUNE_TIMER:-1}"
 MAX_LOG_BYTES="${PORTAL_PROXY_MAX_LOG_BYTES:-67108864}"
 ENDED_OLDER_THAN_DAYS="${PORTAL_PROXY_PRUNE_DAYS:-14}"
+SSHD_RELOAD_STATUS="not changed"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  RESET="$(printf '\033[0m')"
+  BOLD="$(printf '\033[1m')"
+  DIM="$(printf '\033[2m')"
+  RED="$(printf '\033[31m')"
+  GREEN="$(printf '\033[32m')"
+  YELLOW="$(printf '\033[33m')"
+  BLUE="$(printf '\033[34m')"
+  CYAN="$(printf '\033[36m')"
+else
+  RESET=""
+  BOLD=""
+  DIM=""
+  RED=""
+  GREEN=""
+  YELLOW=""
+  BLUE=""
+  CYAN=""
+fi
 
 log() {
-  printf 'portal-proxy installer: %s\n' "$*"
+  printf '%sportal-proxy%s %s\n' "$DIM" "$RESET" "$*"
+}
+
+step() {
+  printf '%s==>%s %s\n' "$BLUE" "$RESET" "$*"
+}
+
+success() {
+  printf '%s[ok]%s %s\n' "$GREEN" "$RESET" "$*"
+}
+
+warn() {
+  printf '%s[!]%s %s\n' "$YELLOW" "$RESET" "$*"
 }
 
 die() {
-  printf 'portal-proxy installer: error: %s\n' "$*" >&2
+  printf '%s[error]%s %s\n' "$RED" "$RESET" "$*" >&2
   exit 1
+}
+
+print_banner() {
+  printf '\n'
+  printf '%s%sPortal Proxy Installer%s\n' "$BOLD" "$CYAN" "$RESET"
+  printf '%sRepository:%s %s\n' "$DIM" "$RESET" "$REPO"
+  printf '%sRelease:%s    %s\n' "$DIM" "$RESET" "$RELEASE_VERSION"
+  printf '%sInstall dir:%s %s\n' "$DIM" "$RESET" "$INSTALL_DIR"
+  printf '\n'
 }
 
 need_root() {
@@ -70,6 +112,15 @@ check_os() {
   die "this installer supports Debian/Ubuntu LXCs only; detected ID=${os_id:-unknown}"
 }
 
+installed_version() {
+  local binary="${INSTALL_DIR}/portal-proxy"
+  [ -x "$binary" ] || return 0
+
+  "$binary" version --json 2>/dev/null \
+    | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n 1
+}
+
 detect_asset() {
   case "$(uname -m)" in
     x86_64|amd64)
@@ -92,7 +143,7 @@ release_url() {
 
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
-  log "installing package requirements"
+  step "Installing package requirements"
   apt-get update
   apt-get install -y \
     ca-certificates \
@@ -107,8 +158,8 @@ install_packages() {
     if apt-cache policy tailscale 2>/dev/null | grep -q 'Candidate: [^()]'; then
       apt-get install -y tailscale
     else
-      log "tailscale package is not available from configured apt repositories"
-      log "install and enable Tailscale before using this proxy"
+      warn "tailscale package is not available from configured apt repositories"
+      warn "install and enable Tailscale before using this proxy"
     fi
   fi
 }
@@ -118,7 +169,7 @@ ensure_user_and_dirs() {
   [ -x "$shell_path" ] || shell_path="/usr/bin/sh"
 
   if ! id "$USER_NAME" >/dev/null 2>&1; then
-    log "creating dedicated user ${USER_NAME}"
+    step "Creating dedicated user ${USER_NAME}"
     useradd --system --create-home --shell "$shell_path" "$USER_NAME"
   else
     usermod --shell "$shell_path" "$USER_NAME"
@@ -145,7 +196,8 @@ install_binary() {
   tmpdir="$(mktemp -d)"
   archive="${tmpdir}/${asset}"
 
-  log "downloading ${RELEASE_VERSION} from ${url}"
+  step "Downloading ${RELEASE_VERSION}"
+  log "$url"
   curl -fsSL "$url" -o "$archive"
   tar -xzf "$archive" -C "$tmpdir"
 
@@ -176,15 +228,48 @@ current_sshd_ports() {
 reload_or_start_sshd() {
   if command -v systemctl >/dev/null 2>&1; then
     systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || true
-    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null \
-      || systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    if systemctl reload ssh 2>/dev/null; then
+      SSHD_RELOAD_STATUS="reloaded ssh"
+      return 0
+    fi
+    if systemctl reload sshd 2>/dev/null; then
+      SSHD_RELOAD_STATUS="reloaded sshd"
+      return 0
+    fi
+    if systemctl restart ssh 2>/dev/null; then
+      SSHD_RELOAD_STATUS="restarted ssh"
+      return 0
+    fi
+    if systemctl restart sshd 2>/dev/null; then
+      SSHD_RELOAD_STATUS="restarted sshd"
+      return 0
+    fi
+    SSHD_RELOAD_STATUS="not reloaded"
     return 0
   fi
 
   if command -v service >/dev/null 2>&1; then
-    service ssh reload 2>/dev/null || service sshd reload 2>/dev/null \
-      || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || true
+    if service ssh reload 2>/dev/null; then
+      SSHD_RELOAD_STATUS="reloaded ssh"
+      return 0
+    fi
+    if service sshd reload 2>/dev/null; then
+      SSHD_RELOAD_STATUS="reloaded sshd"
+      return 0
+    fi
+    if service ssh restart 2>/dev/null; then
+      SSHD_RELOAD_STATUS="restarted ssh"
+      return 0
+    fi
+    if service sshd restart 2>/dev/null; then
+      SSHD_RELOAD_STATUS="restarted sshd"
+      return 0
+    fi
+    SSHD_RELOAD_STATUS="not reloaded"
+    return 0
   fi
+
+  SSHD_RELOAD_STATUS="not reloaded"
 }
 
 install_sshd_config() {
@@ -202,7 +287,7 @@ install_sshd_config() {
   existing_ports="$(current_sshd_ports "$sshd_bin" || true)"
   [ -n "$existing_ports" ] || existing_ports="22"
 
-  log "installing sshd port config for port ${SSHD_PORT}"
+  step "Configuring OpenSSH on port ${SSHD_PORT}"
   {
     printf '# Managed by Portal Proxy installer.\n'
     written=""
@@ -228,7 +313,7 @@ install_prune_timer() {
   command -v systemctl >/dev/null 2>&1 || return 0
   [ -d /etc/systemd/system ] || return 0
 
-  log "installing daily prune timer"
+  step "Installing daily prune timer"
   cat > /etc/systemd/system/portal-proxy-prune.service <<EOF
 [Unit]
 Description=Prune Portal Proxy ended sessions and logs
@@ -257,8 +342,37 @@ EOF
 }
 
 run_doctor() {
-  log "running doctor"
+  step "Running doctor"
   runuser -u "$USER_NAME" -- env PORTAL_PROXY_STATE_DIR="$STATE_DIR" "${INSTALL_DIR}/portal-proxy" doctor
+}
+
+print_summary() {
+  local before="$1"
+  local after="$2"
+
+  printf '\n'
+  if [ -z "$after" ]; then
+    warn "Portal Proxy installed, but the installed version could not be detected"
+    return 0
+  fi
+
+  if [ -z "$before" ]; then
+    success "Portal Proxy installed successfully (${after})"
+  elif [ "$before" = "$after" ]; then
+    success "Portal Proxy reinstalled successfully (${before} -> ${after})"
+  else
+    success "Portal Proxy updated successfully (${before} -> ${after})"
+  fi
+
+  success "Activated binary: ${INSTALL_DIR}/portal-proxy reports ${after}"
+  if [ "$SSHD_RELOAD_STATUS" = "not changed" ]; then
+    log "OpenSSH config was not changed"
+  elif [ "$SSHD_RELOAD_STATUS" = "not reloaded" ]; then
+    warn "OpenSSH reload could not be confirmed; check ssh/sshd manually"
+  else
+    success "OpenSSH ${SSHD_RELOAD_STATUS}; new Portal Proxy SSH connections use ${after}"
+  fi
+  log "Portal Proxy runs per SSH connection, so there is no long-running proxy daemon to restart"
 }
 
 print_next_steps() {
@@ -267,9 +381,8 @@ print_next_steps() {
 
   cat <<EOF
 
-Portal Proxy is installed.
+${BOLD}Next steps${RESET}
 
-Next steps:
 1. Make sure this LXC is reachable only through Tailscale.
    If Tailscale was not already installed from your apt repositories, install it
    from Tailscale's official Debian/Ubuntu instructions and run: sudo tailscale up
@@ -291,13 +404,18 @@ EOF
 
 main() {
   need_root
+  print_banner
   check_os
+  local version_before version_after
+  version_before="$(installed_version || true)"
   install_packages
   ensure_user_and_dirs
   install_binary
+  version_after="$(installed_version || true)"
   install_sshd_config
   install_prune_timer
   run_doctor
+  print_summary "$version_before" "$version_after"
   print_next_steps
 }
 
