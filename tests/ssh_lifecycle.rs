@@ -67,25 +67,40 @@ fn spawn_attach(
     home_dir: &Path,
     session_id: &str,
 ) -> AttachProcess {
-    let mut child = Command::new(portal_proxy())
+    let argv = vec![
+        portal_proxy().to_string(),
+        "--state-dir".to_string(),
+        state_dir.display().to_string(),
+        "--max-log-bytes".to_string(),
+        "1048576".to_string(),
+        "attach".to_string(),
+        "--session-id".to_string(),
+        session_id.to_string(),
+        "--target-host".to_string(),
+        "127.0.0.1".to_string(),
+        "--target-port".to_string(),
+        fixture.port.to_string(),
+        "--target-user".to_string(),
+        fixture.user.clone(),
+        "--cols".to_string(),
+        "80".to_string(),
+        "--rows".to_string(),
+        "24".to_string(),
+    ];
+    let command = argv
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut child = Command::new(command_path("script"))
         .env("HOME", home_dir)
-        .arg("--state-dir")
-        .arg(state_dir)
-        .arg("--max-log-bytes")
-        .arg("1048576")
-        .arg("attach")
-        .arg("--session-id")
-        .arg(session_id)
-        .arg("--target-host")
-        .arg("127.0.0.1")
-        .arg("--target-port")
-        .arg(fixture.port.to_string())
-        .arg("--target-user")
-        .arg(&fixture.user)
-        .arg("--cols")
-        .arg("80")
-        .arg("--rows")
-        .arg("24")
+        .arg("-q")
+        .arg("-e")
+        .arg("-f")
+        .arg("-c")
+        .arg(command)
+        .arg("/dev/null")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -355,6 +370,21 @@ fn command_path(name: &str) -> PathBuf {
         String::from_utf8_lossy(&output.stderr)
     );
     PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_'))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', r#"'\''"#))
 }
 
 struct TempDir {
