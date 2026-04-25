@@ -38,10 +38,13 @@ fn attach_detach_reconnect_replay_and_exit() {
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut first = spawn_attach(&fixture, &state_dir.path, &home_dir.path, &session_id);
-    first.stdin.write_all(b"echo PROXY_FIRST\n").unwrap();
+    first
+        .stdin
+        .write_all(b"echo PROXY_FIRST; sleep 30\n")
+        .unwrap();
     first
         .reader
-        .wait_for(b"PROXY_FIRST", Duration::from_secs(10));
+        .wait_for_occurrences(b"PROXY_FIRST", 2, Duration::from_secs(10));
     first.stdin.write_all(&[0x1c]).unwrap();
     wait_for_attach_exit(first, Duration::from_secs(10));
 
@@ -52,6 +55,7 @@ fn attach_detach_reconnect_replay_and_exit() {
     second
         .reader
         .wait_for(b"PROXY_FIRST", Duration::from_secs(10));
+    second.stdin.write_all(&[0x03]).unwrap();
     second
         .stdin
         .write_all(b"echo PROXY_SECOND\nexit\n")
@@ -175,9 +179,13 @@ impl OutputReader {
     }
 
     fn wait_for(&mut self, needle: &[u8], timeout: Duration) {
+        self.wait_for_occurrences(needle, 1, timeout);
+    }
+
+    fn wait_for_occurrences(&mut self, needle: &[u8], count: usize, timeout: Duration) {
         let start = Instant::now();
         while start.elapsed() < timeout {
-            if contains_bytes(&self.buffer, needle) {
+            if count_occurrences(&self.buffer, needle) >= count {
                 return;
             }
             if let Ok(bytes) = self.rx.recv_timeout(Duration::from_millis(100)) {
@@ -185,17 +193,19 @@ impl OutputReader {
             }
         }
         panic!(
-            "timed out waiting for {:?}; output was:\n{}",
+            "timed out waiting for {} occurrences of {:?}; output was:\n{}",
+            count,
             String::from_utf8_lossy(needle),
             String::from_utf8_lossy(&self.buffer)
         );
     }
 }
 
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
     haystack
         .windows(needle.len())
-        .any(|window| window == needle)
+        .filter(|window| *window == needle)
+        .count()
 }
 
 fn wait_for_attach_exit(mut attach: AttachProcess, timeout: Duration) {
