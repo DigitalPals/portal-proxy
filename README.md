@@ -74,7 +74,7 @@ user and escalates through `sudo` when needed.
 Install a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-proxy/main/scripts/install-debian.sh | PORTAL_PROXY_VERSION=v0.5.0-beta.2 bash
+curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-proxy/main/scripts/install-debian.sh | PORTAL_PROXY_VERSION=v0.5.0-beta.3 bash
 ```
 
 The default installer uses GitHub's `latest` release URL. For beta prereleases,

@@ -13,7 +13,7 @@ Response:
 
 ```json
 {
-  "version": "0.5.0-beta.2",
+  "version": "0.5.0-beta.3",
   "api_version": 1,
   "metadata_schema_version": 1,
   "min_portal_api_version": 1

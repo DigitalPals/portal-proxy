@@ -449,27 +449,14 @@ fn attach_session(state: &State, request: AttachRequest) -> Result<()> {
         remove_file_if_exists(&log_path)?;
     }
 
-    let ssh_command = shell_join([
-        "ssh".to_string(),
-        "-F".to_string(),
-        "/dev/null".to_string(),
-        "-tt".to_string(),
-        "-o".to_string(),
-        "ForwardAgent=yes".to_string(),
-        "-o".to_string(),
-        "IdentitiesOnly=no".to_string(),
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        "StrictHostKeyChecking=accept-new".to_string(),
-        "-o".to_string(),
-        format!("UserKnownHostsFile={}", state.known_hosts_path().display()),
-        "-p".to_string(),
-        target_port.to_string(),
-        "-l".to_string(),
-        target_user.clone(),
-        target_host.clone(),
-    ]);
+    let ssh_command = target_ssh_command(
+        rows,
+        cols,
+        &state.known_hosts_path(),
+        target_port,
+        &target_user,
+        &target_host,
+    );
 
     let mut command = Command::new("dtach");
     command.arg("-A").arg(&socket_path).arg("-r").arg("none");
@@ -532,6 +519,42 @@ fn configured_max_log_bytes() -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MAX_LOG_BYTES)
+}
+
+fn target_ssh_command(
+    rows: u16,
+    cols: u16,
+    known_hosts_path: &Path,
+    target_port: u16,
+    target_user: &str,
+    target_host: &str,
+) -> String {
+    let ssh_invocation = shell_join([
+        "ssh".to_string(),
+        "-F".to_string(),
+        "/dev/null".to_string(),
+        "-tt".to_string(),
+        "-o".to_string(),
+        "ForwardAgent=yes".to_string(),
+        "-o".to_string(),
+        "IdentitiesOnly=no".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        "-o".to_string(),
+        format!("UserKnownHostsFile={}", known_hosts_path.display()),
+        "-p".to_string(),
+        target_port.to_string(),
+        "-l".to_string(),
+        target_user.to_string(),
+        target_host.to_string(),
+    ]);
+
+    format!(
+        "stty rows {} cols {} 2>/dev/null || true; exec {}",
+        rows, cols, ssh_invocation
+    )
 }
 
 fn configured_logging_mode() -> LoggingMode {
@@ -1198,6 +1221,22 @@ mod tests {
         assert_eq!(shell_quote("simple-value"), "simple-value");
         assert_eq!(shell_quote("two words"), "'two words'");
         assert_eq!(shell_quote("john's host"), "'john'\\''s host'");
+    }
+
+    #[test]
+    fn target_ssh_command_sets_pty_size_before_ssh() {
+        let command = target_ssh_command(
+            30,
+            100,
+            Path::new("/tmp/portal known_hosts"),
+            2222,
+            "root",
+            "10.10.0.6",
+        );
+
+        assert!(command.starts_with("stty rows 30 cols 100 2>/dev/null || true; exec ssh "));
+        assert!(command.contains("BatchMode=yes"));
+        assert!(command.contains("'UserKnownHostsFile=/tmp/portal known_hosts'"));
     }
 
     #[test]
