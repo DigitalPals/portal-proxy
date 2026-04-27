@@ -115,6 +115,10 @@ enum CommandKind {
         cols: u16,
         #[arg(long, default_value_t = 24)]
         rows: u16,
+        #[arg(long, hide = true)]
+        identity_file: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        interactive_auth: bool,
     },
     /// Synchronize Portal hosts, settings, snippets, and encrypted vault blobs.
     Sync {
@@ -337,6 +341,8 @@ fn main() -> Result<()> {
             target_user,
             cols,
             rows,
+            identity_file,
+            interactive_auth,
         } => attach_session(
             &state,
             AttachRequest {
@@ -349,6 +355,8 @@ fn main() -> Result<()> {
                 max_log_bytes,
                 logging_mode,
                 allowed_targets,
+                identity_file,
+                batch_mode: !interactive_auth,
             },
         ),
         CommandKind::Sync { command } => sync_command(&state, command),
@@ -404,6 +412,8 @@ fn run_forced_command(state: &State) -> Result<()> {
             target_user,
             cols,
             rows,
+            identity_file,
+            interactive_auth,
         }) => attach_session(
             state,
             AttachRequest {
@@ -416,6 +426,8 @@ fn run_forced_command(state: &State) -> Result<()> {
                 max_log_bytes: configured_max_log_bytes(),
                 logging_mode: configured_logging_mode(),
                 allowed_targets: configured_allowed_targets(),
+                identity_file,
+                batch_mode: !interactive_auth,
             },
         ),
         Some(CommandKind::Sync { command }) => sync_command(state, command),
@@ -612,6 +624,8 @@ struct AttachRequest {
     max_log_bytes: u64,
     logging_mode: LoggingMode,
     allowed_targets: Vec<String>,
+    identity_file: Option<PathBuf>,
+    batch_mode: bool,
 }
 
 fn attach_session(state: &State, request: AttachRequest) -> Result<()> {
@@ -625,6 +639,8 @@ fn attach_session(state: &State, request: AttachRequest) -> Result<()> {
         max_log_bytes,
         logging_mode,
         allowed_targets,
+        identity_file,
+        batch_mode,
     } = request;
 
     validate_target(&target_host, target_port, &target_user)?;
@@ -674,6 +690,8 @@ fn attach_session(state: &State, request: AttachRequest) -> Result<()> {
         target_port,
         &target_user,
         &target_host,
+        identity_file.as_deref(),
+        batch_mode,
     );
 
     let mut command = Command::new("dtach");
@@ -815,8 +833,10 @@ fn target_ssh_command(
     target_port: u16,
     target_user: &str,
     target_host: &str,
+    identity_file: Option<&Path>,
+    batch_mode: bool,
 ) -> String {
-    let ssh_invocation = shell_join([
+    let mut args = vec![
         "ssh".to_string(),
         "-F".to_string(),
         "/dev/null".to_string(),
@@ -824,9 +844,11 @@ fn target_ssh_command(
         "-o".to_string(),
         "ForwardAgent=yes".to_string(),
         "-o".to_string(),
-        "IdentitiesOnly=no".to_string(),
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
+        if identity_file.is_some() {
+            "IdentitiesOnly=yes".to_string()
+        } else {
+            "IdentitiesOnly=no".to_string()
+        },
         "-o".to_string(),
         "StrictHostKeyChecking=accept-new".to_string(),
         "-o".to_string(),
@@ -835,8 +857,18 @@ fn target_ssh_command(
         target_port.to_string(),
         "-l".to_string(),
         target_user.to_string(),
-        target_host.to_string(),
-    ]);
+    ];
+    if batch_mode {
+        args.push("-o".to_string());
+        args.push("BatchMode=yes".to_string());
+    }
+    if let Some(identity_file) = identity_file {
+        args.push("-i".to_string());
+        args.push(identity_file.display().to_string());
+    }
+    args.push(target_host.to_string());
+
+    let ssh_invocation = shell_join(args);
 
     format!(
         "stty rows {} cols {} 2>/dev/null || true; exec {}",
@@ -1615,11 +1647,31 @@ mod tests {
             2222,
             "root",
             "10.10.0.6",
+            None,
+            true,
         );
 
         assert!(command.starts_with("stty rows 30 cols 100 2>/dev/null || true; exec ssh "));
         assert!(command.contains("BatchMode=yes"));
         assert!(command.contains("'UserKnownHostsFile=/tmp/portal known_hosts'"));
+    }
+
+    #[test]
+    fn target_ssh_command_supports_web_identity_and_interactive_auth() {
+        let command = target_ssh_command(
+            24,
+            80,
+            Path::new("/tmp/known_hosts"),
+            22,
+            "deploy",
+            "example.com",
+            Some(Path::new("/tmp/portal hub/key")),
+            false,
+        );
+
+        assert!(!command.contains("BatchMode=yes"));
+        assert!(command.contains("IdentitiesOnly=yes"));
+        assert!(command.contains("-i '/tmp/portal hub/key'"));
     }
 
     #[test]

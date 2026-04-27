@@ -1,26 +1,38 @@
 use std::collections::HashMap;
-use std::io::Read;
+use std::convert::Infallible;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::Router;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Json, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures_util::{SinkExt, StreamExt as FuturesStreamExt};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tokio_stream::once;
+use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
 use url::Url;
 use uuid::Uuid;
@@ -47,6 +59,7 @@ struct AppState {
     state_dir: PathBuf,
     public_url: String,
     ssh_port: u16,
+    sync_events: broadcast::Sender<SyncRevisionEvent>,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -122,6 +135,12 @@ struct SyncServiceState {
     tombstones: Value,
 }
 
+#[derive(Debug, Clone)]
+struct SyncRevisionEvent {
+    user_id: String,
+    services: HashMap<String, String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SyncV2PutRequest {
     services: HashMap<String, SyncV2ServicePut>,
@@ -143,6 +162,24 @@ struct SessionsQuery {
     include_preview: bool,
     #[serde(default = "default_preview_bytes")]
     preview_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebTerminalStart {
+    session_id: Uuid,
+    target_host: String,
+    target_port: u16,
+    target_user: String,
+    cols: u16,
+    rows: u16,
+    #[serde(default)]
+    private_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WebTerminalControl {
+    Resize { cols: u16, rows: u16 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -199,11 +236,13 @@ async fn run_async(
             format!("http://{}", bind_addr)
         }
     });
+    let (sync_events, _) = broadcast::channel(256);
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         state_dir,
         public_url,
         ssh_port,
+        sync_events,
     };
 
     let app = Router::new()
@@ -216,8 +255,10 @@ async fn run_async(
         .route("/api/info", get(api_info))
         .route("/api/me", get(api_me))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/sessions/terminal", get(api_session_terminal))
         .route("/api/sync", get(api_sync_get).put(api_sync_put))
         .route("/api/sync/v2", get(api_sync_v2_get).put(api_sync_v2_put))
+        .route("/api/sync/v2/events", get(api_sync_v2_events))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -674,6 +715,8 @@ async fn api_info(State(state): State<AppState>) -> Response {
         "public_url": state.public_url,
         "capabilities": {
             "sync_v2": true,
+            "sync_events": true,
+            "web_proxy": true,
             "key_vault": true
         },
         "ssh_port": state.ssh_port,
@@ -753,6 +796,228 @@ async fn api_sync_put(
     }
 }
 
+async fn api_session_terminal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = authenticated_user(&state, &headers) {
+        return response;
+    }
+
+    ws.on_upgrade(move |socket| handle_terminal_socket(state, socket))
+        .into_response()
+}
+
+async fn handle_terminal_socket(state: AppState, socket: WebSocket) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    let Some(Ok(WsMessage::Text(start_message))) = ws_rx.next().await else {
+        let _ = ws_tx
+            .send(WsMessage::Text(
+                json!({"type": "error", "message": "missing terminal start request"}).to_string(),
+            ))
+            .await;
+        return;
+    };
+
+    let start: WebTerminalStart = match serde_json::from_str(&start_message) {
+        Ok(start) => start,
+        Err(error) => {
+            let _ = ws_tx
+                .send(WsMessage::Text(
+                    json!({"type": "error", "message": format!("invalid terminal start request: {}", error)})
+                        .to_string(),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    let mut terminal = match spawn_terminal_pty(&state, &start) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            eprintln!("Portal Hub terminal spawn failed: {error}");
+            let _ = ws_tx
+                .send(WsMessage::Text(
+                    json!({"type": "error", "message": error.to_string()}).to_string(),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    let _ = ws_tx
+        .send(WsMessage::Text(
+            json!({"type": "started", "session_id": start.session_id}).to_string(),
+        ))
+        .await;
+
+    loop {
+        tokio::select! {
+            output = terminal.output_rx.recv() => {
+                let Some(output) = output else {
+                    let _ = ws_tx.send(WsMessage::Close(None)).await;
+                    break;
+                };
+                if ws_tx.send(WsMessage::Binary(output)).await.is_err() {
+                    break;
+                }
+            }
+            message = ws_rx.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                match message {
+                    Ok(WsMessage::Binary(data)) => {
+                        if let Err(error) = terminal.writer.write_all(&data) {
+                            let _ = ws_tx
+                                .send(WsMessage::Text(
+                                    json!({"type": "error", "message": format!("terminal write failed: {}", error)})
+                                        .to_string(),
+                                ))
+                                .await;
+                            break;
+                        }
+                    }
+                    Ok(WsMessage::Text(text)) => {
+                        if let Ok(WebTerminalControl::Resize { cols, rows }) =
+                            serde_json::from_str::<WebTerminalControl>(&text)
+                        {
+                            let _ = terminal.master.resize(PtySize {
+                                rows,
+                                cols,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            });
+                        }
+                    }
+                    Ok(WsMessage::Close(_)) => break,
+                    Ok(WsMessage::Ping(data)) => {
+                        let _ = ws_tx.send(WsMessage::Pong(data)).await;
+                    }
+                    Ok(WsMessage::Pong(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    let _ = terminal.child.kill();
+}
+
+struct TerminalPty {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn std::io::Write + Send>,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+    identity_file: Option<PathBuf>,
+}
+
+fn spawn_terminal_pty(state: &AppState, start: &WebTerminalStart) -> Result<TerminalPty> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: start.rows,
+            cols: start.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("failed to open terminal pty")?;
+
+    let identity_file = write_web_identity_file(state, start.private_key.as_deref())?;
+    let mut command =
+        CommandBuilder::new(std::env::current_exe().context("failed to resolve executable")?);
+    command.arg("--state-dir");
+    command.arg(state.state_dir.to_string_lossy().to_string());
+    command.arg("attach");
+    command.arg("--session-id");
+    command.arg(start.session_id.to_string());
+    command.arg("--target-host");
+    command.arg(start.target_host.clone());
+    command.arg("--target-port");
+    command.arg(start.target_port.to_string());
+    command.arg("--target-user");
+    command.arg(start.target_user.clone());
+    command.arg("--cols");
+    command.arg(start.cols.to_string());
+    command.arg("--rows");
+    command.arg(start.rows.to_string());
+    command.arg("--interactive-auth");
+    if let Some(identity_file) = &identity_file {
+        command.arg("--identity-file");
+        command.arg(identity_file.to_string_lossy().to_string());
+    }
+
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .context("failed to start Portal Hub terminal session")?;
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("failed to read terminal pty")?;
+    let writer = pair
+        .master
+        .take_writer()
+        .context("failed to write terminal pty")?;
+    let (output_tx, output_rx) = mpsc::channel(256);
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if output_tx.blocking_send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(TerminalPty {
+        master: pair.master,
+        child,
+        writer,
+        output_rx,
+        identity_file,
+    })
+}
+
+impl Drop for TerminalPty {
+    fn drop(&mut self) {
+        if let Some(path) = self.identity_file.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn write_web_identity_file(state: &AppState, private_key: Option<&str>) -> Result<Option<PathBuf>> {
+    let Some(private_key) = private_key else {
+        return Ok(None);
+    };
+    let key_dir = state.state_dir.join("web-identities");
+    fs::create_dir_all(&key_dir).context("failed to create web identity directory")?;
+    let path = key_dir.join(format!("{}.key", Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .context("failed to create web identity file")?;
+    file.write_all(private_key.as_bytes())
+        .context("failed to write web identity file")?;
+    if !private_key.ends_with('\n') {
+        file.write_all(b"\n")
+            .context("failed to finish web identity file")?;
+    }
+    Ok(Some(path))
+}
+
 async fn api_sync_v2_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let (user_id, _) = match authenticated_user(&state, &headers) {
         Ok(user) => user,
@@ -779,17 +1044,63 @@ async fn api_sync_v2_put(
         Err(response) => return response,
     };
     match save_sync_v2(&state, &user_id, request) {
-        Ok(services) => Json(json!({
-            "api_version": 2,
-            "generated_at": Utc::now(),
-            "services": services,
-        }))
-        .into_response(),
+        Ok(services) => {
+            broadcast_sync_revisions(&state, &user_id, &services);
+            Json(json!({
+                "api_version": 2,
+                "generated_at": Utc::now(),
+                "services": services,
+            }))
+            .into_response()
+        }
         Err(error) if error.to_string().contains("revision conflict") => {
             json_error(StatusCode::CONFLICT, error)
         }
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
+}
+
+async fn api_sync_v2_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+
+    let initial_services = match load_sync_v2(&state, &user_id) {
+        Ok(services) => revision_map(&services),
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let initial = once(Ok::<Event, Infallible>(
+        sync_event(initial_services).unwrap_or_else(|error| error_event(error.to_string())),
+    ));
+
+    let stream_user_id = user_id;
+    let update_state = state.clone();
+    let updates = BroadcastStream::new(state.sync_events.subscribe()).filter_map(move |event| {
+        let stream_user_id = stream_user_id.clone();
+        let update_state = update_state.clone();
+        async move {
+            match event {
+                Ok(event) if event.user_id == stream_user_id => {
+                    Some(Ok(sync_event(event.services)
+                        .unwrap_or_else(|error| error_event(error.to_string()))))
+                }
+                Ok(_) => None,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => {
+                    let event = load_sync_v2(&update_state, &stream_user_id)
+                        .map(|services| revision_map(&services))
+                        .and_then(|revisions| sync_event(revisions).map_err(Into::into))
+                        .unwrap_or_else(|error| error_event(error.to_string()));
+                    Some(Ok(event))
+                }
+            }
+        }
+    });
+
+    let stream = initial.chain(updates);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 fn listed_sessions(
@@ -1107,6 +1418,37 @@ fn save_sync_v2(
         json!({"services": services.keys().cloned().collect::<Vec<_>>()}),
     )?;
     Ok(services)
+}
+
+fn broadcast_sync_revisions(
+    state: &AppState,
+    user_id: &str,
+    services: &HashMap<String, SyncServiceState>,
+) {
+    let _ = state.sync_events.send(SyncRevisionEvent {
+        user_id: user_id.to_string(),
+        services: revision_map(services),
+    });
+}
+
+fn revision_map(services: &HashMap<String, SyncServiceState>) -> HashMap<String, String> {
+    services
+        .iter()
+        .map(|(service, state)| (service.clone(), state.revision.clone()))
+        .collect()
+}
+
+fn sync_event(services: HashMap<String, String>) -> Result<Event, serde_json::Error> {
+    serde_json::to_string(&json!({
+        "api_version": 2,
+        "generated_at": Utc::now(),
+        "services": services,
+    }))
+    .map(|data| Event::default().event("sync").data(data))
+}
+
+fn error_event(message: String) -> Event {
+    Event::default().event("error").data(message)
 }
 
 fn default_sync_v2_from_legacy(legacy: &SyncState) -> HashMap<String, SyncServiceState> {
@@ -1901,11 +2243,13 @@ mod tests {
     fn test_state() -> AppState {
         let db = Connection::open_in_memory().unwrap();
         init_db(&db).unwrap();
+        let (sync_events, _) = broadcast::channel(16);
         AppState {
             db: Arc::new(Mutex::new(db)),
             state_dir: std::env::temp_dir().join(format!("portal-hub-test-{}", Uuid::new_v4())),
             public_url: "http://portal-hub.localhost:8080".to_string(),
             ssh_port: 2222,
+            sync_events,
         }
     }
 
@@ -1996,11 +2340,13 @@ mod tests {
         )
         .unwrap();
         init_db(&db).unwrap();
+        let (sync_events, _) = broadcast::channel(16);
         let state = AppState {
             db: Arc::new(Mutex::new(db)),
             state_dir: std::env::temp_dir().join(format!("portal-hub-test-{}", Uuid::new_v4())),
             public_url: "http://portal-hub.localhost:8080".to_string(),
             ssh_port: 2222,
+            sync_events,
         };
 
         register_inner(
@@ -2080,5 +2426,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("revision conflict for hosts"));
+    }
+
+    #[test]
+    fn sync_revision_map_contains_service_revisions_only() {
+        let mut services = HashMap::new();
+        services.insert(
+            "hosts".to_string(),
+            SyncServiceState {
+                revision: "rev-hosts".to_string(),
+                payload: json!({"hosts": []}),
+                tombstones: json!([]),
+            },
+        );
+
+        let revisions = revision_map(&services);
+
+        assert_eq!(revisions.get("hosts"), Some(&"rev-hosts".to_string()));
+        assert_eq!(revisions.len(), 1);
+    }
+
+    #[test]
+    fn sync_event_serializes_revision_payload() {
+        let mut revisions = HashMap::new();
+        revisions.insert("settings".to_string(), "rev-settings".to_string());
+
+        let event = sync_event(revisions).unwrap();
+        let debug = format!("{:?}", event);
+
+        assert!(debug.contains("sync"));
+        assert!(debug.contains("rev-settings"));
     }
 }
