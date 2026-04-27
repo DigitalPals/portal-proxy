@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0-beta.9 - 2026-04-27
+
+- Hide `script` recorder headers from web session previews so thumbnails start
+  at the terminal output instead of capture metadata.
+
 ## 0.5.0-beta.8 - 2026-04-27
 
 - Restart the web service during installer updates so it does not keep running

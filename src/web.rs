@@ -1233,7 +1233,20 @@ fn session_preview(
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
+    if len <= take {
+        strip_script_header(&mut bytes);
+    }
     Ok((Some(BASE64_STANDARD.encode(bytes)), len > take, modified))
+}
+
+fn strip_script_header(bytes: &mut Vec<u8>) {
+    if !bytes.starts_with(b"Script started on ") {
+        return;
+    }
+
+    if let Some(line_end) = bytes.iter().position(|byte| *byte == b'\n') {
+        bytes.drain(..=line_end);
+    }
 }
 
 fn default_preview_bytes() -> u64 {
@@ -2444,6 +2457,25 @@ mod tests {
     fn public_url_rejects_non_http_urls() {
         assert!(canonicalize_public_url("portal-hub.risk-bull.ts.net").is_err());
         assert!(canonicalize_public_url("ssh://portal-hub.risk-bull.ts.net").is_err());
+    }
+
+    #[test]
+    fn session_preview_strips_script_recorder_header() {
+        let state_dir = std::env::temp_dir().join(format!("portal-hub-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(logs_dir(&state_dir)).unwrap();
+        let session_id = Uuid::new_v4();
+        std::fs::write(
+            logs_dir(&state_dir).join(format!("{}.typescript", session_id)),
+            b"Script started on 2026-04-27 14:29:29+00:00 [COMMAND=\"ssh host\"]\nreal motd\n",
+        )
+        .unwrap();
+
+        let (preview_base64, truncated, _) = session_preview(&state_dir, session_id, 1024).unwrap();
+        let preview = BASE64_STANDARD.decode(preview_base64.unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&state_dir);
+
+        assert!(!truncated);
+        assert_eq!(preview, b"real motd\n");
     }
 
     #[test]

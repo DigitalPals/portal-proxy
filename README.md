@@ -102,7 +102,7 @@ user and escalates through `sudo` when needed.
 Install a specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-hub/main/scripts/install-debian.sh | PORTAL_HUB_VERSION=v0.5.0-beta.8 bash
+curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-hub/main/scripts/install-debian.sh | PORTAL_HUB_VERSION=v0.5.0-beta.9 bash
 ```
 
 The default installer uses GitHub's `latest` release URL. For beta prereleases,
