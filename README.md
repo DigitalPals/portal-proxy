@@ -1,247 +1,313 @@
 # Portal Hub
 
-Portal Hub keeps Portal SSH sessions alive when the Portal app or the local
-machine disconnects. It is intended to run on a small Linux host or LXC that is
-reachable only over Tailscale.
+Portal Hub is the always-on companion service for Portal. Run it on a small
+Linux host or LXC in your tailnet, then let Portal use it for persistent SSH
+sessions, browser sign-in, device sync, session previews, and encrypted key
+vault sync.
 
-Status: beta. The core workflow works, the JSON API is versioned, lifecycle
-integration coverage exists, and operational safeguards are in place. The
-project is still pre-1.0, and breaking changes may still happen before 1.0.
+It is built for the practical homelab and ops workflow: start a terminal from
+Portal, close your laptop, switch networks, come back later, and reconnect to
+the same shell.
+
+Status: beta. The core flows are working and versioned, but the project is
+still pre-1.0 and API or storage details may change before a stable release.
+
+## What It Does
+
+| Feature | What you get |
+| --- | --- |
+| Persistent SSH sessions | Remote shells keep running on the Hub after Portal disconnects. |
+| Session resume | Reopen active sessions from Portal, including sessions detached from another device. |
+| Terminal thumbnails | Portal can show session previews from Hub replay logs. |
+| Web terminal transport | Portal connects through an OAuth-authenticated WebSocket instead of relying only on SSH forced-command mode. |
+| Browser sign-in | Portal signs in with OAuth authorization code + PKCE and stores tokens in the OS keychain. |
+| Profile sync | Hosts, settings, snippets, and vault metadata sync between Portal devices. |
+| Encrypted key vault sync | Private keys are stored as Portal-encrypted blobs; Hub never receives the vault passphrase or decrypted keys. |
+| Tailscale Serve support | Use a clean HTTPS `.ts.net` URL while the Hub service binds safely to loopback. |
+| Operational tooling | `doctor`, `version --json`, `list`, `prune`, target allowlists, bounded logs, and systemd units. |
 
 ## How It Works
 
-Portal signs in to the Hub web service with OAuth + PKCE and opens persistent
-terminal streams over an authenticated WebSocket. The Hub starts the target SSH
-session inside `dtach`, records terminal output with `script`, and reconnects
-Portal to the same `dtach` session when Portal opens the session again. The
-legacy SSH forced-command mode remains available for manual operation and older
-clients.
+Portal signs in to the Hub web service with OAuth + PKCE. For persistent
+terminal sessions, Portal opens an authenticated WebSocket and asks Hub to start
+or attach to a target SSH session. Hub runs that target session inside `dtach`,
+records a bounded replay log with `script`, and reconnects Portal to the same
+session later.
 
-Target authentication is non-interactive. Portal should forward a local
-`ssh-agent`; the proxy does not need target private keys installed on disk.
+Typing `exit` in the remote shell ends the real target session. Closing Portal,
+losing Wi-Fi, or moving to another machine only detaches the Portal client.
 
-Typing `exit` in the remote shell ends the real target session. Closing Portal
-or losing network connectivity only detaches Portal from the session.
+Portal Hub also keeps a revisioned sync store for Portal data:
 
-## Security Model
+- Hosts, settings, and snippets are stored as readable JSON in the Hub state
+  directory.
+- Vault entries are stored as encrypted blobs produced by Portal.
+- Sync v2 tracks each service independently and exposes an SSE event stream so
+  other Portal clients can refresh quickly after a change.
 
-Portal Hub is designed for Tailscale-only access.
+The legacy OpenSSH forced-command mode is still available for manual operation
+and older clients.
 
-- Do not expose the proxy SSH port to the public internet.
-- Use Tailscale ACLs to restrict who can reach the proxy host.
-- Run the proxy as a dedicated non-root user.
-- Use the OAuth web API over Tailscale or behind an HTTPS reverse proxy.
-- Keep the legacy OpenSSH forced-command entry restricted if you enable it.
-- Keep `/var/lib/portal-hub` private to the proxy user.
+## Recommended Setup
 
-Portal Hub uses SSH agent forwarding from Portal to connect onward to target
-hosts. Only enable it for environments where that trust model is acceptable.
+Portal Hub is intended to live on a private host reachable through Tailscale.
+The common setup is:
 
-Portal Hub can also store Portal hosts, settings, snippets, and encrypted vault
-items for desktop sync. Hosts, settings, and snippets are readable in the Hub
-state directory. Private keys are stored only as Portal-encrypted blobs; Hub
-does not receive the vault passphrase or decrypted keys.
-
-For Portal desktop sign-in, sync, session listing, and WebSocket terminal
-transport, run the web server:
-
-```sh
-portal-hub web --bind 0.0.0.0:8080 --public-url https://hub.example.test
+```text
+Portal app  ->  Tailscale / Tailscale Serve  ->  portal-hub-web.service
+Portal app  ->  Portal Hub SSH port 2222     ->  legacy forced-command fallback
+Portal Hub  ->  target SSH hosts
 ```
 
-With Tailscale Serve, bind the Hub web service to loopback and advertise the
-Serve URL:
+Recommended minimum LXC size for personal use:
 
-```sh
-portal-hub web --bind 127.0.0.1:8080 --public-url https://portal-hub.example.ts.net
-tailscale serve --bg http://127.0.0.1:8080
+```text
+1 vCPU
+512 MB to 1 GB RAM
+10 GB disk
+512 MB swap
 ```
 
-On first visit, `/admin` creates the owner account with a password. Portal
-desktop signs in through the system browser with OAuth authorization code +
-PKCE, then stores Hub tokens in the OS keychain. Portal Hub stores only an
-Argon2 password hash.
+Disk is the main resource to watch because replay logs power reconnect previews
+and thumbnails.
 
-## Session Logs
+## Install
 
-Portal Hub stores terminal output in `/var/lib/portal-hub/logs` so Portal
-can replay and thumbnail session state after reconnecting.
-
-Those logs can contain secrets shown in terminals, including tokens, passwords,
-command output, and environment values. Treat the state directory as sensitive
-data. Use `portal-hub prune` regularly.
-
-By default, live session logs use a 16 MiB moving window. This protects the
-proxy host from unbounded disk growth without terminating long-running target
-sessions that produce heavy output. Set `PORTAL_HUB_MAX_LOG_BYTES=0` only if
-you have a separate disk quota or retention strategy.
-
-## Requirements
-
-- Linux
-- OpenSSH server and client
-- Tailscale
-- `dtach`
-- `script` from util-linux
-
-## Install On Debian / Ubuntu LXC
-
-One-line installer:
+On a Debian or Ubuntu LXC, run the installer as root or a sudo-capable user:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-hub/main/scripts/install-debian.sh | bash
 ```
 
-The installer checks for Debian/Ubuntu, installs required packages, creates the
-dedicated `portal-hub` user, installs or updates the release binary, adds
-an OpenSSH port config so SSH listens on the existing port plus `2222` by
-default, enables a daily prune timer, and runs `portal-hub doctor`. Run it
-from a root shell or from a user with `sudo`; the script detects the current
-user and escalates through `sudo` when needed.
+The installer:
 
-Install a specific release:
+- installs `openssh-server`, `openssh-client`, `dtach`, `util-linux`, `curl`,
+  and `tar`;
+- installs Tailscale when it is available from the configured apt repositories;
+- creates the dedicated `portal-hub` user;
+- creates `/var/lib/portal-hub` with private permissions;
+- installs or updates the release binary in `/usr/local/bin`;
+- configures OpenSSH to keep the existing SSH port and add `2222` by default;
+- installs and restarts `portal-hub-web.service`;
+- enables a daily prune timer;
+- runs `portal-hub doctor`.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-hub/main/scripts/install-debian.sh | PORTAL_HUB_VERSION=v0.5.0-beta.9 bash
-```
+Update later by running the same installer again.
 
-The default installer uses GitHub's `latest` release URL. For beta prereleases,
-set `PORTAL_HUB_VERSION` explicitly if GitHub has not promoted that release as
-latest.
+### Install With Tailscale Serve
 
-Use a custom proxy SSH port:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-hub/main/scripts/install-debian.sh | PORTAL_HUB_SSH_PORT=2022 bash
-```
-
-## Build
+For a polished HTTPS tailnet URL, bind Hub to loopback and publish it with
+Tailscale Serve:
 
 ```sh
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-hub/main/scripts/install-debian.sh \
+  | PORTAL_HUB_WEB_BIND=127.0.0.1:8080 \
+    PORTAL_HUB_PUBLIC_URL=https://portal-hub.example.ts.net \
+    bash
+
+tailscale serve --bg http://127.0.0.1:8080
 ```
 
-Install the binary:
+Use your real Serve URL in `PORTAL_HUB_PUBLIC_URL`, for example
+`https://portal-hub.your-tailnet.ts.net`.
+
+### Useful Installer Options
 
 ```sh
-sudo install -m 0755 target/release/portal-hub /usr/local/bin/portal-hub
+# Pin a release
+curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-hub/main/scripts/install-debian.sh \
+  | PORTAL_HUB_VERSION=v0.5.0-beta.9 bash
+
+# Use a custom Portal Hub SSH port
+curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-hub/main/scripts/install-debian.sh \
+  | PORTAL_HUB_SSH_PORT=2022 bash
+
+# Bind the web service to a private address or loopback
+curl -fsSL https://raw.githubusercontent.com/DigitalPals/portal-hub/main/scripts/install-debian.sh \
+  | PORTAL_HUB_WEB_BIND=127.0.0.1:8080 bash
 ```
 
-## Basic Setup
+## First Run
 
-Create a dedicated user and state directory:
-
-```sh
-sudo useradd --system --create-home --shell /bin/sh portal-hub
-sudo install -d -o portal-hub -g portal-hub -m 0700 /var/lib/portal-hub
-sudo install -d -o portal-hub -g portal-hub -m 0700 /home/portal-hub/.ssh
-```
-
-Add your Portal client public key to
-`/home/portal-hub/.ssh/authorized_keys` with a forced command:
+After installation, open the Hub admin page through the same URL Portal will
+use:
 
 ```text
-restrict,pty,agent-forwarding,command="/usr/local/bin/portal-hub serve --stdio" ssh-ed25519 AAAA...
+https://portal-hub.example.ts.net/admin
 ```
 
-Run the health check as the proxy user:
+The first visit creates the owner account. Portal then signs in through the
+browser and stores Hub tokens locally in the OS keychain. Hub stores only an
+Argon2 password hash, OAuth tokens, sync state, session metadata, and replay
+logs in `/var/lib/portal-hub`.
+
+Check the service:
 
 ```sh
+sudo systemctl status portal-hub-web
 sudo -u portal-hub portal-hub doctor
 ```
 
-List active sessions:
+## Portal Setup
 
-```sh
-sudo -u portal-hub portal-hub list --active
+In Portal, open Settings and start the Portal Hub setup flow.
+
+Use:
+
+- Host: the Tailscale name, IP, or full Tailscale Serve URL.
+- Web URL: the HTTPS URL that reaches `portal-hub-web.service`.
+- Web port: `8080`, unless you changed the web bind port. Portal does not append
+  this port when Host or Web URL already contains a full URL.
+- Sign in through the browser.
+- Enable the services you want: hosts, settings, snippets, key vault, and
+  persistent sessions.
+- Enable Portal Hub on individual SSH hosts that should use persistent sessions.
+
+When an SSH host uses public-key auth through the web terminal transport, Portal
+sends the private key material only for the lifetime of that terminal request.
+Hub writes it to a temporary `0600` identity file and removes it when the
+terminal stream ends.
+
+## Security Model
+
+Portal Hub is designed for Tailscale-only access.
+
+- Do not expose the Hub SSH port or web service to the public internet.
+- Use Tailscale ACLs to restrict who can reach the Hub host.
+- Run Hub as the dedicated non-root `portal-hub` user.
+- Keep `/var/lib/portal-hub` private to the Hub user.
+- Treat terminal replay logs as sensitive; they can contain command output,
+  tokens, passwords, environment values, and pasted secrets.
+- Use `PORTAL_HUB_ALLOWED_TARGETS` on shared Hub hosts to restrict where Hub can
+  connect.
+- Keep the legacy SSH forced-command entry restricted if you enable it.
+
+Portal Hub can sync encrypted vault blobs, but it must never receive the vault
+passphrase, derived key, or decrypted private keys.
+
+## Session Logs And Retention
+
+Hub stores terminal output in:
+
+```text
+/var/lib/portal-hub/logs
 ```
 
-Prune old ended sessions and trim ended-session logs:
+By default, live logs use a 16 MiB moving window. Older replay output may be
+discarded, but the target session keeps running.
+
+Useful commands:
 
 ```sh
+sudo -u portal-hub portal-hub list --active --include-preview --format v1
+sudo -u portal-hub portal-hub prune --dry-run
 sudo -u portal-hub portal-hub prune --ended-older-than-days 14 --max-log-bytes 16777216
 ```
 
-## Portal Configuration
+Disable replay logging if you do not want terminal output stored:
 
-In Portal settings, start the Portal Hub onboarding wizard and configure:
-
-- Host: the Portal Hub DNS name, IP, or full Tailscale Serve URL, for example
-  `https://portal-hub.example.ts.net`
-- Web port: `8080` unless you installed the web service on another port. Portal
-  does not append this port when the Host or Web URL field contains a full URL.
-
-Portal opens the Hub OAuth page in your browser. After sign-in, choose which
-services to enable: hosts sync, settings sync, snippets sync, key vault, and
-persistent sessions / proxy.
-
-Desktop sync, session listing, and persistent proxy sessions use the OAuth web
-API. Portal sends local private-key material only for the lifetime of a WebSocket
-terminal request when a host is configured for public-key auth; Hub stores it in
-a temporary `0600` identity file and removes it when the terminal stream ends.
-
-## JSON API
-
-The legacy list output is a JSON array:
-
-```sh
-portal-hub list --active --include-preview
+```text
+PORTAL_HUB_LOGGING_MODE=disabled
 ```
 
-New clients should request the versioned format:
-
-```sh
-portal-hub list --active --include-preview --format v1
-```
-
-The versioned response contains `api_version`, `generated_at`, and `sessions`.
+Sessions still persist across disconnects, but replay and thumbnails are not
+available.
 
 ## Operations
 
-Useful commands:
+Common commands:
 
 ```sh
 portal-hub doctor
 portal-hub doctor --json
 portal-hub version --json
-portal-hub web --bind 0.0.0.0:8080
-systemctl status portal-hub-web
+portal-hub web --bind 127.0.0.1:8080 --public-url https://portal-hub.example.ts.net
 portal-hub list --active --include-preview --format v1
 portal-hub sync get --format v1
 portal-hub prune --dry-run
-portal-hub prune --ended-older-than-days 14 --max-log-bytes 16777216
 ```
 
-Environment variables:
+Common environment variables:
 
 ```text
 PORTAL_HUB_STATE_DIR=/var/lib/portal-hub
+PORTAL_HUB_PUBLIC_URL=https://portal-hub.example.ts.net
 PORTAL_HUB_MAX_LOG_BYTES=16777216
 PORTAL_HUB_LOGGING_MODE=full
 PORTAL_HUB_ALLOWED_TARGETS=*.internal,10.10.0.0/16
 ```
 
-Logging modes:
+`PORTAL_HUB_ALLOWED_TARGETS` supports exact hostnames, `*` wildcard patterns,
+and IP CIDR ranges.
 
-- `full`: store terminal output for replay and thumbnails.
-- `disabled`: do not store terminal output. Reconnect persistence still works,
-  but replay and thumbnails are unavailable.
+## Legacy Forced-Command Mode
 
-`PORTAL_HUB_ALLOWED_TARGETS` is optional. When set, attach requests are
-restricted to exact hostnames, `*` wildcard patterns, or IP CIDR ranges.
+The web transport is the primary Portal workflow, but the SSH forced-command
+mode remains available.
 
-Sync operations are revisioned. `portal-hub sync put` requires
-`--expected-revision` and rejects stale writes instead of merging or silently
-overwriting another device's changes.
+Add the Portal client public key to:
 
-## Known Limitations
+```text
+/home/portal-hub/.ssh/authorized_keys
+```
 
-- SSH terminal sessions only.
-- Target host authentication currently depends on SSH agent forwarding.
-- Browser/PWA SSH is not part of this release.
-- Live replay logs are retained as a bounded moving window, so older terminal
-  output may be discarded while the target session continues running.
-- The project is still pre-1.0, and breaking changes may happen before 1.0.
+Use this restricted prefix:
 
-See [docs/deployment.md](docs/deployment.md) for a fuller LXC deployment guide
-and [docs/api.md](docs/api.md) for the JSON API contract.
+```text
+restrict,pty,agent-forwarding,command="/usr/local/bin/portal-hub serve --stdio" ssh-ed25519 AAAA...
+```
+
+Smoke test from the Portal machine:
+
+```sh
+ssh -A -tt -p 2222 portal-hub@TAILSCALE_NAME -- portal-hub doctor
+```
+
+Target authentication in forced-command mode is non-interactive and depends on
+SSH agent forwarding from the Portal client.
+
+## Build From Source
+
+```sh
+cargo build --release
+sudo install -m 0755 target/release/portal-hub /usr/local/bin/portal-hub
+```
+
+Run the web service manually:
+
+```sh
+PORTAL_HUB_STATE_DIR=/var/lib/portal-hub \
+  portal-hub web --bind 127.0.0.1:8080 --public-url https://portal-hub.example.ts.net
+```
+
+## API And Integrations
+
+Portal Hub exposes versioned CLI JSON and OAuth-authenticated web APIs:
+
+- `GET /api/info`
+- `GET /api/me`
+- `GET /api/sync`
+- `PUT /api/sync`
+- `GET /api/sync/v2`
+- `PUT /api/sync/v2`
+- `GET /api/sync/v2/events`
+- `GET /api/sessions`
+- `GET /api/sessions/terminal`
+
+See [docs/api.md](docs/api.md) for request and response details.
+
+## Current Limitations
+
+- SSH terminal sessions are supported; browser/PWA SSH is not part of this
+  release.
+- Legacy forced-command target authentication depends on SSH agent forwarding.
+- Replay logs are bounded, so older terminal output can be trimmed while the
+  target session continues running.
+- The project is pre-1.0 and may still make breaking changes.
+
+## More Docs
+
+- [Deployment guide](docs/deployment.md)
+- [API contract](docs/api.md)
+- [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
