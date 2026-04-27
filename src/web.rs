@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -1797,7 +1798,11 @@ fn vault_key_count(vault: &Value) -> usize {
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to a string should not fail");
+    }
+    hex
 }
 
 fn json_error(status: StatusCode, error: anyhow::Error) -> Response {
