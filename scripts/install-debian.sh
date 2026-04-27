@@ -11,8 +11,12 @@ USER_NAME="${PORTAL_HUB_USER:-portal-hub}"
 INSTALL_SSHD_CONFIG="${PORTAL_HUB_INSTALL_SSHD_CONFIG:-${PORTAL_HUB_INSTALL_SSHD_MATCH:-1}}"
 SSHD_PORT="${PORTAL_HUB_SSH_PORT:-2222}"
 INSTALL_WEB_SERVICE="${PORTAL_HUB_INSTALL_WEB_SERVICE:-1}"
-WEB_BIND="${PORTAL_HUB_WEB_BIND:-0.0.0.0:8080}"
 PUBLIC_URL="${PORTAL_HUB_PUBLIC_URL:-}"
+DEFAULT_WEB_BIND="0.0.0.0:8080"
+if [ -n "$PUBLIC_URL" ]; then
+  DEFAULT_WEB_BIND="127.0.0.1:8080"
+fi
+WEB_BIND="${PORTAL_HUB_WEB_BIND:-$DEFAULT_WEB_BIND}"
 INSTALL_PRUNE_TIMER="${PORTAL_HUB_INSTALL_PRUNE_TIMER:-1}"
 MAX_LOG_BYTES="${PORTAL_HUB_MAX_LOG_BYTES:-16777216}"
 ENDED_OLDER_THAN_DAYS="${PORTAL_HUB_PRUNE_DAYS:-14}"
@@ -447,12 +451,13 @@ ${BOLD}Next steps${RESET}
    restrict,pty,agent-forwarding,command="${INSTALL_DIR}/portal-hub serve --stdio" ssh-ed25519 AAAA...
 
 3. In Portal settings, configure:
-   Host: this LXC's Tailscale name or IP
+   Host: this LXC's Tailscale name, IP, or full Tailscale Serve URL
    Web port: ${WEB_BIND##*:}
    Web URL: the HTTPS URL that reaches portal-hub-web.service
 
    If you are using Tailscale Serve or another reverse proxy, point it at:
    http://${WEB_BIND}
+   and reinstall with PORTAL_HUB_PUBLIC_URL set to the HTTPS URL.
 
    If this host is reachable only over Tailscale and you intentionally bind the
    web service to a Tailscale/private address, use that HTTP URL in Portal.

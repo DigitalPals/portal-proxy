@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 use tokio_stream::once;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
-use url::Url;
+use url::{Host, Url};
 use uuid::Uuid;
 
 const CLIENT_ID: &str = "portal-desktop";
@@ -230,13 +230,16 @@ async fn run_async(
     let bind_addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid bind address: {}", bind))?;
-    let public_url = public_url.unwrap_or_else(|| {
-        if bind_addr.ip().is_loopback() {
-            format!("http://portal-hub.localhost:{}", bind_addr.port())
-        } else {
-            format!("http://{}", bind_addr)
+    let public_url = match public_url {
+        Some(public_url) => canonicalize_public_url(&public_url)?,
+        None => {
+            if bind_addr.ip().is_loopback() {
+                format!("http://portal-hub.localhost:{}", bind_addr.port())
+            } else {
+                format!("http://{}", bind_addr)
+            }
         }
-    });
+    };
     let (sync_events, _) = broadcast::channel(256);
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
@@ -1621,6 +1624,32 @@ fn validate_authorize_query(query: &AuthorizeQuery) -> Result<()> {
     Ok(())
 }
 
+fn canonicalize_public_url(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("public_url must not be empty");
+    }
+    let url = Url::parse(trimmed).context("public_url must be an absolute URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("public_url must use http or https");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("public_url must not include credentials");
+    }
+    let host = match url
+        .host()
+        .ok_or_else(|| anyhow!("public_url must include a host"))?
+    {
+        Host::Domain(domain) => domain.to_string(),
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => format!("[{}]", ip),
+    };
+    Ok(match url.port() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    })
+}
+
 fn admin_continue_url(params: &HashMap<String, String>) -> Option<String> {
     let query = AuthorizeQuery {
         response_type: params.get("response_type")?.clone(),
@@ -2328,6 +2357,24 @@ mod tests {
         assert!(continue_url.starts_with("/oauth/authorize?"));
         assert!(continue_url.contains("client_id=portal-desktop"));
         assert!(continue_url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A49152%2Fcallback"));
+    }
+
+    #[test]
+    fn public_url_is_canonicalized_to_origin() {
+        assert_eq!(
+            canonicalize_public_url("https://portal-hub.risk-bull.ts.net/").unwrap(),
+            "https://portal-hub.risk-bull.ts.net"
+        );
+        assert_eq!(
+            canonicalize_public_url("https://portal-hub.risk-bull.ts.net:8443/path?x=1").unwrap(),
+            "https://portal-hub.risk-bull.ts.net:8443"
+        );
+    }
+
+    #[test]
+    fn public_url_rejects_non_http_urls() {
+        assert!(canonicalize_public_url("portal-hub.risk-bull.ts.net").is_err());
+        assert!(canonicalize_public_url("ssh://portal-hub.risk-bull.ts.net").is_err());
     }
 
     #[test]

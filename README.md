@@ -49,6 +49,14 @@ transport, run the web server:
 portal-hub web --bind 0.0.0.0:8080 --public-url https://hub.example.test
 ```
 
+With Tailscale Serve, bind the Hub web service to loopback and advertise the
+Serve URL:
+
+```sh
+portal-hub web --bind 127.0.0.1:8080 --public-url https://portal-hub.example.ts.net
+tailscale serve --bg http://127.0.0.1:8080
+```
+
 On first visit, `/admin` creates the owner account with a password. Portal
 desktop signs in through the system browser with OAuth authorization code +
 PKCE, then stores Hub tokens in the OS keychain. Portal Hub stores only an
@@ -158,8 +166,10 @@ sudo -u portal-hub portal-hub prune --ended-older-than-days 14 --max-log-bytes 1
 
 In Portal settings, start the Portal Hub onboarding wizard and configure:
 
-- Host: the Portal Hub DNS name or IP, for example `portal-hub.localhost`
-- Web port: `8080` unless you installed the web service on another port
+- Host: the Portal Hub DNS name, IP, or full Tailscale Serve URL, for example
+  `https://portal-hub.example.ts.net`
+- Web port: `8080` unless you installed the web service on another port. Portal
+  does not append this port when the Host or Web URL field contains a full URL.
 
 Portal opens the Hub OAuth page in your browser. After sign-in, choose which
 services to enable: hosts sync, settings sync, snippets sync, key vault, and

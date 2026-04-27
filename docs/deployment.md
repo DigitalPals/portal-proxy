@@ -115,6 +115,15 @@ Manual service installation can use
 it through Tailscale Serve or another HTTPS reverse proxy when using a public
 URL.
 
+For Tailscale Serve, set `PORTAL_HUB_PUBLIC_URL` to the Serve origin and bind
+the Hub web service to loopback:
+
+```sh
+PORTAL_HUB_PUBLIC_URL=https://portal-hub.example.ts.net \
+  portal-hub web --bind 127.0.0.1:8080
+tailscale serve --bg http://127.0.0.1:8080
+```
+
 ## Legacy SSH Forced Command
 
 Add the Portal client public key to:
@@ -235,7 +244,7 @@ available.
 In Portal:
 
 - Enable Portal Hub globally.
-- Set host to the proxy Tailscale name or IP.
+- Set host to the proxy Tailscale name, IP, or full Tailscale Serve URL.
 - Set web port to `8080`, unless you changed `PORTAL_HUB_WEB_BIND`.
 - Set Web URL to the HTTPS reverse-proxy or Tailscale Serve URL. If the web
   service is bound directly to a Tailscale-only/private address, set the matching

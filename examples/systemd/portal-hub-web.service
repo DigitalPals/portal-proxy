@@ -9,7 +9,9 @@ User=portal-hub
 Group=portal-hub
 Environment=PORTAL_HUB_STATE_DIR=/var/lib/portal-hub
 Environment=PORTAL_HUB_SSH_PORT=2222
-ExecStart=/usr/local/bin/portal-hub web --bind 0.0.0.0:8080
+# Set this when using Tailscale Serve or another HTTPS reverse proxy.
+# Environment=PORTAL_HUB_PUBLIC_URL=https://portal-hub.example.ts.net
+ExecStart=/usr/local/bin/portal-hub web --bind 127.0.0.1:8080
 Restart=on-failure
 RestartSec=5s
 

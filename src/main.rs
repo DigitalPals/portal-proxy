@@ -129,7 +129,7 @@ enum CommandKind {
     Web {
         #[arg(long, default_value = "0.0.0.0:8080")]
         bind: String,
-        #[arg(long)]
+        #[arg(long, env = "PORTAL_HUB_PUBLIC_URL")]
         public_url: Option<String>,
     },
     /// Internal recorder used inside detached dtach sessions.
