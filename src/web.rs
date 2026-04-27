@@ -930,33 +930,26 @@ fn spawn_terminal_pty(state: &AppState, start: &WebTerminalStart) -> Result<Term
         .context("failed to open terminal pty")?;
 
     let identity_file = write_web_identity_file(state, start.private_key.as_deref())?;
-    let mut command =
-        CommandBuilder::new(std::env::current_exe().context("failed to resolve executable")?);
-    command.arg("--state-dir");
-    command.arg(state.state_dir.to_string_lossy().to_string());
-    command.arg("attach");
-    command.arg("--session-id");
-    command.arg(start.session_id.to_string());
-    command.arg("--target-host");
-    command.arg(start.target_host.clone());
-    command.arg("--target-port");
-    command.arg(start.target_port.to_string());
-    command.arg("--target-user");
-    command.arg(start.target_user.clone());
-    command.arg("--cols");
-    command.arg(start.cols.to_string());
-    command.arg("--rows");
-    command.arg(start.rows.to_string());
-    command.arg("--interactive-auth");
-    if let Some(identity_file) = &identity_file {
-        command.arg("--identity-file");
-        command.arg(identity_file.to_string_lossy().to_string());
-    }
-
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .context("failed to start Portal Hub terminal session")?;
+    let child = match spawn_attach_command(&*pair.slave, state, start, identity_file.as_ref(), true)
+    {
+        Ok(child) => child,
+        Err(primary_error) => {
+            eprintln!(
+                "Portal Hub terminal controlling-tty spawn failed: {primary_error:#}; retrying without controlling tty"
+            );
+            spawn_attach_command(&*pair.slave, state, start, identity_file.as_ref(), false)
+                .inspect_err(|_| {
+                    if let Some(path) = &identity_file {
+                        let _ = fs::remove_file(path);
+                    }
+                })
+                .with_context(|| {
+                    format!(
+                        "failed to start Portal Hub terminal session after controlling-tty retry; first error: {primary_error:#}"
+                    )
+                })?
+        }
+    };
     drop(pair.slave);
 
     let mut reader = pair
@@ -990,6 +983,42 @@ fn spawn_terminal_pty(state: &AppState, start: &WebTerminalStart) -> Result<Term
         output_rx,
         identity_file,
     })
+}
+
+fn spawn_attach_command(
+    slave: &dyn portable_pty::SlavePty,
+    state: &AppState,
+    start: &WebTerminalStart,
+    identity_file: Option<&PathBuf>,
+    controlling_tty: bool,
+) -> Result<Box<dyn portable_pty::Child + Send + Sync>> {
+    let mut command =
+        CommandBuilder::new(std::env::current_exe().context("failed to resolve executable")?);
+    command.set_controlling_tty(controlling_tty);
+    command.arg("--state-dir");
+    command.arg(state.state_dir.to_string_lossy().to_string());
+    command.arg("attach");
+    command.arg("--session-id");
+    command.arg(start.session_id.to_string());
+    command.arg("--target-host");
+    command.arg(start.target_host.clone());
+    command.arg("--target-port");
+    command.arg(start.target_port.to_string());
+    command.arg("--target-user");
+    command.arg(start.target_user.clone());
+    command.arg("--cols");
+    command.arg(start.cols.to_string());
+    command.arg("--rows");
+    command.arg(start.rows.to_string());
+    command.arg("--interactive-auth");
+    if let Some(identity_file) = identity_file {
+        command.arg("--identity-file");
+        command.arg(identity_file.to_string_lossy().to_string());
+    }
+
+    slave
+        .spawn_command(command)
+        .context("failed to start Portal Hub terminal session")
 }
 
 impl Drop for TerminalPty {

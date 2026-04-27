@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0-beta.7 - 2026-04-27
+
+- Added Tailscale Serve public URL support for installer-managed web services.
+- Added a Portal web-terminal PTY spawn fallback for containerized systemd
+  environments where assigning the child controlling TTY fails.
+
 ## 0.5.0-beta.6 - 2026-04-27
 
 - Fixed GitHub release packaging after the project rename so the installer can
