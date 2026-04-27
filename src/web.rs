@@ -38,7 +38,10 @@ use tower_http::trace::TraceLayer;
 use url::{Host, Url};
 use uuid::Uuid;
 
-const CLIENT_ID: &str = "portal-desktop";
+const DESKTOP_CLIENT_ID: &str = "portal-desktop";
+const ANDROID_CLIENT_ID: &str = "portal-android";
+const ANDROID_REDIRECT_SCHEME: &str = "com.digitalpals.portal.android";
+const ANDROID_REDIRECT_PATH: &str = "/oauth2redirect";
 const ACCESS_TOKEN_TTL_HOURS: i64 = 24;
 const REFRESH_TOKEN_TTL_DAYS: i64 = 90;
 const AUTH_CODE_TTL_MINUTES: i64 = 5;
@@ -673,10 +676,14 @@ fn exchange_authorization_code(state: &AppState, request: TokenRequest) -> Resul
         bail!("invalid code_verifier");
     }
     db.execute("DELETE FROM auth_codes WHERE code = ?1", [&code])?;
-    issue_tokens(&db, &user_id)
+    issue_tokens(&db, &user_id, &client_id)
 }
 
 fn exchange_refresh_token(state: &AppState, request: TokenRequest) -> Result<TokenResponse> {
+    let client_id = request.client_id.unwrap_or_else(|| "unknown".to_string());
+    if client_id != "unknown" && !is_supported_client_id(&client_id) {
+        bail!("unknown client_id");
+    }
     let refresh_token = request
         .refresh_token
         .ok_or_else(|| anyhow!("missing refresh_token"))?;
@@ -702,7 +709,7 @@ fn exchange_refresh_token(state: &AppState, request: TokenRequest) -> Result<Tok
         "DELETE FROM refresh_tokens WHERE token_hash = ?1",
         [&refresh_hash],
     )?;
-    issue_tokens(&db, &user_id)
+    issue_tokens(&db, &user_id, &client_id)
 }
 
 async fn api_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1646,7 +1653,7 @@ fn default_tombstones() -> Value {
     json!([])
 }
 
-fn issue_tokens(db: &Connection, user_id: &str) -> Result<TokenResponse> {
+fn issue_tokens(db: &Connection, user_id: &str, client_id: &str) -> Result<TokenResponse> {
     let access_token = random_token();
     let refresh_token = random_token();
     let now = Utc::now();
@@ -1664,7 +1671,7 @@ fn issue_tokens(db: &Connection, user_id: &str) -> Result<TokenResponse> {
         db,
         "token_issued",
         Some(user_id),
-        json!({"client_id": CLIENT_ID}),
+        json!({"client_id": client_id}),
     )?;
     Ok(TokenResponse {
         access_token,
@@ -1686,7 +1693,7 @@ fn validate_authorize_query(query: &AuthorizeQuery) -> Result<()> {
     if query.response_type != "code" {
         bail!("unsupported response_type");
     }
-    if query.client_id != CLIENT_ID {
+    if !is_supported_client_id(&query.client_id) {
         bail!("unknown client_id");
     }
     if query.code_challenge_method != "S256" {
@@ -1696,14 +1703,24 @@ fn validate_authorize_query(query: &AuthorizeQuery) -> Result<()> {
         bail!("invalid OAuth request");
     }
     let redirect = Url::parse(&query.redirect_uri)?;
-    if redirect.scheme() != "http" {
-        bail!("redirect_uri must use loopback http");
-    }
-    let host = redirect.host_str().unwrap_or_default();
-    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-        bail!("redirect_uri must be loopback");
+    if query.client_id == DESKTOP_CLIENT_ID {
+        if redirect.scheme() != "http" {
+            bail!("redirect_uri must use loopback http");
+        }
+        let host = redirect.host_str().unwrap_or_default();
+        if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+            bail!("redirect_uri must be loopback");
+        }
+    } else if redirect.scheme() != ANDROID_REDIRECT_SCHEME
+        || redirect.path() != ANDROID_REDIRECT_PATH
+    {
+        bail!("redirect_uri is not registered for Portal Android");
     }
     Ok(())
+}
+
+fn is_supported_client_id(client_id: &str) -> bool {
+    client_id == DESKTOP_CLIENT_ID || client_id == ANDROID_CLIENT_ID
 }
 
 fn canonicalize_public_url(input: &str) -> Result<String> {
@@ -2373,7 +2390,7 @@ mod tests {
     fn test_oauth() -> AuthorizeQuery {
         AuthorizeQuery {
             response_type: "code".to_string(),
-            client_id: CLIENT_ID.to_string(),
+            client_id: DESKTOP_CLIENT_ID.to_string(),
             redirect_uri: "http://127.0.0.1:49152/callback".to_string(),
             code_challenge: "abcdefghijklmnopqrstuvwxyz123456".to_string(),
             code_challenge_method: "S256".to_string(),
@@ -2417,6 +2434,29 @@ mod tests {
                 .starts_with("http://127.0.0.1:49152/callback?code=")
         );
         assert!(response.redirect_uri.contains("&state=state-state-state"));
+    }
+
+    #[test]
+    fn android_oauth_redirect_is_accepted() {
+        let mut query = test_oauth();
+        query.client_id = ANDROID_CLIENT_ID.to_string();
+        query.redirect_uri = format!("{ANDROID_REDIRECT_SCHEME}:{ANDROID_REDIRECT_PATH}");
+
+        validate_authorize_query(&query).unwrap();
+    }
+
+    #[test]
+    fn android_oauth_rejects_loopback_redirect() {
+        let mut query = test_oauth();
+        query.client_id = ANDROID_CLIENT_ID.to_string();
+
+        let error = validate_authorize_query(&query).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("redirect_uri is not registered for Portal Android")
+        );
     }
 
     #[test]
