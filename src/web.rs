@@ -1,15 +1,19 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
+use argon2::password_hash::{SaltString, rand_core::OsRng};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::Router;
 use axum::extract::{Json, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rand::RngCore;
@@ -20,15 +24,12 @@ use sha2::{Digest, Sha256};
 use tower_http::trace::TraceLayer;
 use url::Url;
 use uuid::Uuid;
-use webauthn_rs::prelude::{
-    Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
-    RegisterPublicKeyCredential, Webauthn, WebauthnBuilder,
-};
 
 const CLIENT_ID: &str = "portal-desktop";
 const ACCESS_TOKEN_TTL_HOURS: i64 = 24;
 const REFRESH_TOKEN_TTL_DAYS: i64 = 90;
 const AUTH_CODE_TTL_MINUTES: i64 = 5;
+const MIN_PASSWORD_LEN: usize = 12;
 
 const PORTAL_ASCII_LOGO: &str = r#"                                  .             oooo
                                 .o8             `888
@@ -43,22 +44,9 @@ o888o"#;
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Connection>>,
-    pending_registrations: Arc<Mutex<HashMap<String, PendingRegistration>>>,
-    pending_authentications: Arc<Mutex<HashMap<String, PendingAuthentication>>>,
+    state_dir: PathBuf,
     public_url: String,
-}
-
-struct PendingRegistration {
-    user_id: Uuid,
-    username: String,
-    state: PasskeyRegistration,
-}
-
-struct PendingAuthentication {
-    user_id: String,
-    username: String,
-    query: AuthorizeQuery,
-    state: PasskeyAuthentication,
+    ssh_port: u16,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -72,32 +60,16 @@ struct AuthorizeQuery {
 }
 
 #[derive(Debug, Deserialize)]
-struct RegisterStartRequest {
+struct RegisterRequest {
     username: String,
+    password: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct RegisterFinishRequest {
-    flow_id: String,
-    credential: RegisterPublicKeyCredential,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoginStartRequest {
+struct LoginRequest {
     username: String,
+    password: String,
     oauth: AuthorizeQuery,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoginFinishRequest {
-    flow_id: String,
-    credential: PublicKeyCredential,
-}
-
-#[derive(Debug, Serialize)]
-struct WebauthnStartResponse {
-    flow_id: String,
-    public_key: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,12 +115,75 @@ struct SyncPutRequest {
     vault: Value,
 }
 
-pub fn run(state_dir: PathBuf, bind: String, public_url: Option<String>) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new().context("failed to start Tokio runtime")?;
-    rt.block_on(run_async(state_dir, bind, public_url))
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncServiceState {
+    revision: String,
+    payload: Value,
+    tombstones: Value,
 }
 
-async fn run_async(state_dir: PathBuf, bind: String, public_url: Option<String>) -> Result<()> {
+#[derive(Debug, Deserialize)]
+struct SyncV2PutRequest {
+    services: HashMap<String, SyncV2ServicePut>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncV2ServicePut {
+    expected_revision: String,
+    payload: Value,
+    #[serde(default = "default_tombstones")]
+    tombstones: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionsQuery {
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    include_preview: bool,
+    #[serde(default = "default_preview_bytes")]
+    preview_bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionMetadata {
+    schema_version: u16,
+    session_id: Uuid,
+    session_name: String,
+    target_host: String,
+    target_port: u16,
+    target_user: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListedSession {
+    #[serde(flatten)]
+    metadata: SessionMetadata,
+    active: bool,
+    last_output_at: Option<DateTime<Utc>>,
+    preview_base64: Option<String>,
+    preview_truncated: bool,
+}
+
+pub fn run(state_dir: PathBuf, bind: String, public_url: Option<String>) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new().context("failed to start Tokio runtime")?;
+    let ssh_port = std::env::var("PORTAL_HUB_SSH_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(2222);
+    rt.block_on(run_async(state_dir, bind, public_url, ssh_port))
+}
+
+async fn run_async(
+    state_dir: PathBuf,
+    bind: String,
+    public_url: Option<String>,
+    ssh_port: u16,
+) -> Result<()> {
     std::fs::create_dir_all(&state_dir).context("failed to create Portal Hub state dir")?;
     let db_path = state_dir.join("hub.db");
     let db = Connection::open(db_path).context("failed to open Portal Hub database")?;
@@ -164,25 +199,25 @@ async fn run_async(state_dir: PathBuf, bind: String, public_url: Option<String>)
             format!("http://{}", bind_addr)
         }
     });
-    webauthn_for_public_url(&public_url)?;
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
-        pending_registrations: Arc::new(Mutex::new(HashMap::new())),
-        pending_authentications: Arc::new(Mutex::new(HashMap::new())),
+        state_dir,
         public_url,
+        ssh_port,
     };
 
     let app = Router::new()
         .route("/", get(root))
         .route("/admin", get(admin_page))
-        .route("/webauthn/register/start", post(register_start))
-        .route("/webauthn/register/finish", post(register_finish))
-        .route("/webauthn/login/start", post(login_start))
-        .route("/webauthn/login/finish", post(login_finish))
+        .route("/auth/register", post(register))
+        .route("/auth/login", post(login))
         .route("/oauth/authorize", get(authorize_page))
         .route("/oauth/token", post(token))
+        .route("/api/info", get(api_info))
         .route("/api/me", get(api_me))
+        .route("/api/sessions", get(api_sessions))
         .route("/api/sync", get(api_sync_get).put(api_sync_put))
+        .route("/api/sync/v2", get(api_sync_v2_get).put(api_sync_v2_put))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -200,15 +235,8 @@ fn init_db(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
             username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS passkeys (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            passkey TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            last_used_at TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(id)
         );
         CREATE TABLE IF NOT EXISTS auth_codes (
             code TEXT PRIMARY KEY,
@@ -237,6 +265,15 @@ fn init_db(db: &Connection) -> Result<()> {
             vault TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS sync_services (
+            user_id TEXT NOT NULL,
+            service TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            tombstones TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, service)
+        );
         CREATE TABLE IF NOT EXISTS audit_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
@@ -246,6 +283,7 @@ fn init_db(db: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    ensure_password_hash_column(db)?;
     Ok(())
 }
 
@@ -259,7 +297,7 @@ async fn root(State(state): State<AppState>) -> Response {
                 r#"<section class="panel">
                     <p class="eyebrow">Hub online</p>
                     <h1>Portal Hub is running.</h1>
-                    <p class="lead">Desktop clients can authenticate with passkeys and sync through <code>{}</code>.</p>
+                    <p class="lead">Desktop clients can authenticate and sync through <code>{}</code>.</p>
                   </section>"#,
                 html_escape(&state.public_url)
             ),
@@ -268,54 +306,91 @@ async fn root(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn admin_page(State(state): State<AppState>) -> Response {
+async fn admin_page(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let continue_url = admin_continue_url(&params).unwrap_or_default();
     if user_count(&state).unwrap_or(0) > 0 {
+        if let Ok(Some(username)) = owner_missing_password(&state) {
+            return Html(page(
+                "Set Portal Hub Password",
+                &format!(
+                    r#"<section class="panel setup-panel">
+                        <div id="setup-error" class="error" hidden></div>
+                        <form id="owner-form" class="flow" autocomplete="off" data-password-only="true" data-continue-url="{}">
+                          <p class="eyebrow">Owner password</p>
+                          <h1>Set a password.</h1>
+                          <p class="lead">This existing owner account needs a password before Portal desktop can sign in.</p>
+                          <label>Account name<input id="username" name="username" autocomplete="username" required minlength="2" maxlength="64" readonly value="{}"></label>
+                          <label>Password<input id="password" name="password" type="password" autocomplete="new-password" required minlength="{}" maxlength="256"></label>
+                          <label>Confirm password<input id="password-confirm" name="password-confirm" type="password" autocomplete="new-password" required minlength="{}" maxlength="256"></label>
+                          <button type="submit" id="create-button">Set password</button>
+                        </form>
+                      </section>"#,
+                    html_escape(&continue_url),
+                    html_escape(&username),
+                    MIN_PASSWORD_LEN,
+                    MIN_PASSWORD_LEN
+                ),
+            ))
+            .into_response();
+        }
         return Html(page(
             "Portal Hub",
-            r#"<section class="panel">
+            &format!(
+                r#"<section class="panel">
                 <p class="eyebrow">Owner exists</p>
                 <h1>Portal Hub is ready.</h1>
-                <p class="lead">Continue through Portal desktop sign-in to authenticate with your passkey.</p>
+                <p class="lead">Continue through Portal desktop sign-in to authenticate with your password.</p>
+                {}
               </section>"#,
+                continue_button_html(&continue_url)
+            ),
         ))
         .into_response();
     }
 
     Html(page(
         "Create Portal Hub Owner",
-        r#"<section class="panel setup-panel">
+        &format!(
+            r#"<section class="panel setup-panel">
             <div class="steps" aria-label="Setup progress">
               <span class="step-dot active" data-step-dot="1">1</span>
               <span class="step-line"></span>
               <span class="step-dot" data-step-dot="2">2</span>
             </div>
             <div id="setup-error" class="error" hidden></div>
-            <form id="owner-form" class="flow" autocomplete="off">
+            <form id="owner-form" class="flow" autocomplete="off" data-continue-url="{}">
               <div class="wizard-step" data-step="1">
                 <p class="eyebrow">First owner</p>
                 <h1>Name this account.</h1>
                 <p class="lead">This name is stored on the Hub and shown in Portal after sign-in.</p>
-                <label>Account name<input id="username" name="username" autocomplete="username webauthn" required minlength="2" maxlength="64" autofocus></label>
+                <label>Account name<input id="username" name="username" autocomplete="username" required minlength="2" maxlength="64" autofocus></label>
                 <button type="button" id="next-button">Next</button>
               </div>
               <div class="wizard-step" data-step="2" hidden>
-                <p class="eyebrow">Passkey</p>
-                <h1>Create a passkey.</h1>
-                <p class="lead">Portal Hub does not store passwords. Your browser or 1Password will prompt you to create the passkey.</p>
-                <div class="passkey-callout">
-                  <span class="passkey-icon" aria-hidden="true"></span>
+                <p class="eyebrow">Password</p>
+                <h1>Create a password.</h1>
+                <p class="lead">This password protects Portal desktop sign-in to this Hub.</p>
+                <label>Password<input id="password" name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="256"></label>
+                <label>Confirm password<input id="password-confirm" name="password-confirm" type="password" autocomplete="new-password" required minlength="12" maxlength="256"></label>
+                <div class="security-callout">
+                  <span class="security-icon" aria-hidden="true"></span>
                   <div>
-                    <strong>Use this device, a security key, or your phone.</strong>
-                    <p>The QR or cross-device prompt is controlled by your browser and passkey provider.</p>
+                    <strong>Use a unique password.</strong>
+                    <p>The Hub stores only an Argon2 password hash.</p>
                   </div>
                 </div>
                 <div class="actions">
                   <button type="button" class="secondary" id="back-button">Back</button>
-                  <button type="submit" id="create-button">Create passkey</button>
+                  <button type="submit" id="create-button">Create owner</button>
                 </div>
               </div>
             </form>
           </section>"#,
+            html_escape(&continue_url)
+        ),
     ))
     .into_response()
 }
@@ -324,9 +399,6 @@ async fn authorize_page(
     State(state): State<AppState>,
     Query(query): Query<AuthorizeQuery>,
 ) -> Response {
-    if user_count(&state).unwrap_or(0) == 0 {
-        return Redirect::to("/admin").into_response();
-    }
     if let Err(error) = validate_authorize_query(&query) {
         return (
             StatusCode::BAD_REQUEST,
@@ -334,135 +406,107 @@ async fn authorize_page(
         )
             .into_response();
     }
+    if user_count(&state).unwrap_or(0) == 0 {
+        let location = authorize_path("/admin", &query);
+        return Redirect::to(&location).into_response();
+    }
 
     Html(page(
         "Sign In To Portal Hub",
         r#"<section class="panel auth-panel">
             <p class="eyebrow">Portal desktop sign-in</p>
-            <h1>Use your passkey.</h1>
-            <p class="lead">Portal Hub will confirm your passkey, then return you to Portal.</p>
+            <h1>Sign in.</h1>
+            <p class="lead">Portal Hub will confirm your password, then return you to Portal.</p>
             <div id="login-error" class="error" hidden></div>
             <form id="login-form" class="flow" autocomplete="on">
-              <label>Account name<input id="username" name="username" autocomplete="username webauthn" required autofocus></label>
-              <button type="submit" id="login-button">Sign in with passkey</button>
+              <label>Account name<input id="username" name="username" autocomplete="username" required autofocus></label>
+              <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+              <button type="submit" id="login-button">Sign in</button>
             </form>
-            <div class="passkey-callout compact">
-              <span class="passkey-icon" aria-hidden="true"></span>
-              <p>1Password, your browser, or your operating system may offer a QR code for another device.</p>
-            </div>
           </section>"#,
     ))
     .into_response()
 }
 
-async fn register_start(
-    State(state): State<AppState>,
-    Json(request): Json<RegisterStartRequest>,
-) -> Response {
-    match register_start_inner(&state, request) {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => json_error(StatusCode::BAD_REQUEST, error),
-    }
-}
-
-fn register_start_inner(
-    state: &AppState,
-    request: RegisterStartRequest,
-) -> Result<WebauthnStartResponse> {
-    if user_count(state)? > 0 {
-        bail!("owner account already exists");
-    }
-    validate_username(&request.username)?;
-    let username = request.username.trim().to_string();
-    let user_id = Uuid::new_v4();
-    let webauthn = webauthn(state)?;
-    let (challenge, registration_state) =
-        webauthn.start_passkey_registration(user_id, &username, &username, None)?;
-    let flow_id = random_token();
-    state
-        .pending_registrations
-        .lock()
-        .map_err(|_| anyhow!("registration lock poisoned"))?
-        .insert(
-            flow_id.clone(),
-            PendingRegistration {
-                user_id,
-                username,
-                state: registration_state,
-            },
-        );
-    let mut public_key = serde_json::to_value(challenge)?;
-    apply_passkey_client_preferences(&mut public_key, true);
-    Ok(WebauthnStartResponse {
-        flow_id,
-        public_key,
-    })
-}
-
-async fn register_finish(
-    State(state): State<AppState>,
-    Json(request): Json<RegisterFinishRequest>,
-) -> Response {
-    match register_finish_inner(&state, request) {
+async fn register(State(state): State<AppState>, Json(request): Json<RegisterRequest>) -> Response {
+    match register_inner(&state, request) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(error) => json_error(StatusCode::BAD_REQUEST, error),
     }
 }
 
-fn register_finish_inner(state: &AppState, request: RegisterFinishRequest) -> Result<()> {
-    if user_count(state)? > 0 {
-        bail!("owner account already exists");
-    }
-    let pending = state
-        .pending_registrations
-        .lock()
-        .map_err(|_| anyhow!("registration lock poisoned"))?
-        .remove(&request.flow_id)
-        .ok_or_else(|| anyhow!("registration flow expired"))?;
-    let passkey =
-        webauthn(state)?.finish_passkey_registration(&request.credential, &pending.state)?;
+fn register_inner(state: &AppState, request: RegisterRequest) -> Result<()> {
+    validate_username(&request.username)?;
+    validate_password(&request.password)?;
+    let username = request.username.trim().to_string();
+    let user_id = Uuid::new_v4();
+    let password_hash = hash_password(&request.password)?;
     let db = state
         .db
         .lock()
         .map_err(|_| anyhow!("database lock poisoned"))?;
-    ensure_credential_is_unique(&db, &passkey)?;
-    insert_user(&db, pending.user_id, &pending.username)?;
-    insert_passkey(&db, pending.user_id, &passkey)?;
+
+    let count: i64 = db.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+    if count == 0 {
+        insert_user(&db, user_id, &username, &password_hash)?;
+        audit_db(
+            &db,
+            "owner_created",
+            Some(&user_id.to_string()),
+            json!({"username": username, "auth_method": "password"}),
+        )?;
+        return Ok(());
+    }
+
+    let existing = db
+        .query_row(
+            "SELECT id, COALESCE(password_hash, '') FROM users WHERE username = ?1",
+            [username.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((existing_user_id, existing_password_hash)) = existing else {
+        bail!("owner account already exists");
+    };
+    if !existing_password_hash.is_empty() {
+        bail!("owner account already exists");
+    }
+    db.execute(
+        "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+        params![password_hash, existing_user_id],
+    )?;
     audit_db(
         &db,
-        "owner_created",
-        Some(&pending.user_id.to_string()),
-        json!({"username": pending.username, "auth_method": "passkey"}),
+        "owner_password_set",
+        Some(&existing_user_id),
+        json!({"username": username, "auth_method": "password"}),
     )?;
     Ok(())
 }
 
-async fn login_start(
-    State(state): State<AppState>,
-    Json(request): Json<LoginStartRequest>,
-) -> Response {
-    match login_start_inner(&state, request) {
+async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Response {
+    match login_inner(&state, request) {
         Ok(response) => Json(response).into_response(),
         Err(error) => json_error(StatusCode::UNAUTHORIZED, error),
     }
 }
 
-fn login_start_inner(
-    state: &AppState,
-    request: LoginStartRequest,
-) -> Result<WebauthnStartResponse> {
+fn login_inner(state: &AppState, request: LoginRequest) -> Result<LoginFinishResponse> {
     validate_authorize_query(&request.oauth)?;
     validate_username(&request.username)?;
+    if request.password.is_empty() {
+        bail!("missing password");
+    }
     let username = request.username.trim().to_string();
     let db = state
         .db
         .lock()
         .map_err(|_| anyhow!("database lock poisoned"))?;
-    let Some(user_id) = db
+    let Some((user_id, password_hash)) = db
         .query_row(
-            "SELECT id FROM users WHERE username = ?1",
+            "SELECT id, COALESCE(password_hash, '') FROM users WHERE username = ?1",
             [username.as_str()],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
     else {
@@ -474,94 +518,24 @@ fn login_start_inner(
         )?;
         bail!("unknown account");
     };
-    let passkeys = load_passkeys_for_user(&db, &user_id)?;
-    if passkeys.is_empty() {
+    if password_hash.is_empty() {
         audit_db(
             &db,
             "login_failed",
             Some(&user_id),
-            json!({"username": username, "reason": "no_passkeys"}),
+            json!({"username": username, "reason": "password_not_set"}),
         )?;
-        bail!("this account has no passkeys");
+        bail!("this account needs a password");
     }
-    drop(db);
-
-    let webauthn = webauthn(state)?;
-    let passkey_values: Vec<Passkey> = passkeys.into_iter().map(|(_, passkey)| passkey).collect();
-    let (challenge, auth_state) = webauthn.start_passkey_authentication(&passkey_values)?;
-    let flow_id = random_token();
-    state
-        .pending_authentications
-        .lock()
-        .map_err(|_| anyhow!("authentication lock poisoned"))?
-        .insert(
-            flow_id.clone(),
-            PendingAuthentication {
-                user_id,
-                username,
-                query: request.oauth,
-                state: auth_state,
-            },
-        );
-    let mut public_key = serde_json::to_value(challenge)?;
-    apply_passkey_client_preferences(&mut public_key, false);
-    Ok(WebauthnStartResponse {
-        flow_id,
-        public_key,
-    })
-}
-
-async fn login_finish(
-    State(state): State<AppState>,
-    Json(request): Json<LoginFinishRequest>,
-) -> Response {
-    match login_finish_inner(&state, request) {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => json_error(StatusCode::UNAUTHORIZED, error),
-    }
-}
-
-fn login_finish_inner(
-    state: &AppState,
-    request: LoginFinishRequest,
-) -> Result<LoginFinishResponse> {
-    let pending = state
-        .pending_authentications
-        .lock()
-        .map_err(|_| anyhow!("authentication lock poisoned"))?
-        .remove(&request.flow_id)
-        .ok_or_else(|| anyhow!("authentication flow expired"))?;
-    let auth_result =
-        webauthn(state)?.finish_passkey_authentication(&request.credential, &pending.state)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| anyhow!("database lock poisoned"))?;
-    let mut passkeys = load_passkeys_for_user(&db, &pending.user_id)?;
-    let mut matched_passkey_id = None;
-    for (passkey_id, passkey) in passkeys.iter_mut() {
-        if passkey.cred_id() == auth_result.cred_id() {
-            if auth_result.needs_update() {
-                passkey.update_credential(&auth_result);
-                update_passkey(&db, passkey_id, passkey)?;
-            }
-            matched_passkey_id = Some(passkey_id.clone());
-            break;
-        }
-    }
-    let Some(passkey_id) = matched_passkey_id else {
+    if !verify_password(&request.password, &password_hash)? {
         audit_db(
             &db,
             "login_failed",
-            Some(&pending.user_id),
-            json!({"username": pending.username, "reason": "credential_not_found"}),
+            Some(&user_id),
+            json!({"username": username, "reason": "invalid_password"}),
         )?;
-        bail!("passkey is not registered to this account");
-    };
-    db.execute(
-        "UPDATE passkeys SET last_used_at = ?1 WHERE id = ?2",
-        params![Utc::now().to_rfc3339(), passkey_id],
-    )?;
+        bail!("invalid password");
+    }
 
     let code = random_token();
     let expires_at = (Utc::now() + ChronoDuration::minutes(AUTH_CODE_TTL_MINUTES)).to_rfc3339();
@@ -569,26 +543,26 @@ fn login_finish_inner(
         "INSERT INTO auth_codes (code, user_id, client_id, redirect_uri, code_challenge, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             code,
-            pending.user_id,
-            pending.query.client_id,
-            pending.query.redirect_uri,
-            pending.query.code_challenge,
+            user_id,
+            request.oauth.client_id,
+            request.oauth.redirect_uri,
+            request.oauth.code_challenge,
             expires_at
         ],
     )?;
     audit_db(
         &db,
         "login_success",
-        Some(&pending.user_id),
-        json!({"client_id": pending.query.client_id, "auth_method": "passkey"}),
+        Some(&user_id),
+        json!({"client_id": request.oauth.client_id, "auth_method": "password"}),
     )?;
 
     Ok(LoginFinishResponse {
         redirect_uri: format!(
             "{}?code={}&state={}",
-            pending.query.redirect_uri,
+            request.oauth.redirect_uri,
             urlencoding::encode(&code),
-            urlencoding::encode(&pending.query.state)
+            urlencoding::encode(&request.oauth.state)
         ),
     })
 }
@@ -693,6 +667,49 @@ async fn api_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
 }
 
+async fn api_info(State(state): State<AppState>) -> Response {
+    Json(json!({
+        "api_version": 2,
+        "version": env!("CARGO_PKG_VERSION"),
+        "public_url": state.public_url,
+        "capabilities": {
+            "sync_v2": true,
+            "key_vault": true
+        },
+        "ssh_port": state.ssh_port,
+        "ssh_username": "portal-hub",
+    }))
+    .into_response()
+}
+
+async fn api_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionsQuery>,
+) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match listed_sessions(&state.state_dir, query) {
+        Ok(sessions) => {
+            audit(
+                &state,
+                "sessions_list",
+                &user_id,
+                json!({"count": sessions.len()}),
+            );
+            Json(json!({
+                "api_version": 2,
+                "generated_at": Utc::now(),
+                "sessions": sessions,
+            }))
+            .into_response()
+        }
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
 async fn api_sync_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let (user_id, _) = match authenticated_user(&state, &headers) {
         Ok(user) => user,
@@ -734,6 +751,137 @@ async fn api_sync_put(
         }
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
+}
+
+async fn api_sync_v2_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match load_sync_v2(&state, &user_id) {
+        Ok(services) => Json(json!({
+            "api_version": 2,
+            "generated_at": Utc::now(),
+            "services": services,
+        }))
+        .into_response(),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+async fn api_sync_v2_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SyncV2PutRequest>,
+) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match save_sync_v2(&state, &user_id, request) {
+        Ok(services) => Json(json!({
+            "api_version": 2,
+            "generated_at": Utc::now(),
+            "services": services,
+        }))
+        .into_response(),
+        Err(error) if error.to_string().contains("revision conflict") => {
+            json_error(StatusCode::CONFLICT, error)
+        }
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+fn listed_sessions(
+    state_dir: &std::path::Path,
+    query: SessionsQuery,
+) -> Result<Vec<ListedSession>> {
+    ensure_session_dirs(state_dir)?;
+    let mut sessions = Vec::new();
+    for entry in std::fs::read_dir(sessions_dir(state_dir))? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let metadata: SessionMetadata = serde_json::from_str(&content)?;
+        let active = metadata.ended_at.is_none()
+            && sessions_socket_path(state_dir, metadata.session_id).exists();
+        if query.active && !active {
+            continue;
+        }
+        let (preview_base64, preview_truncated, last_output_at) = if query.include_preview {
+            session_preview(state_dir, metadata.session_id, query.preview_bytes)?
+        } else {
+            (None, false, None)
+        };
+        sessions.push(ListedSession {
+            metadata,
+            active,
+            last_output_at,
+            preview_base64,
+            preview_truncated,
+        });
+    }
+    sessions.sort_by_key(|session| session.metadata.updated_at);
+    sessions.reverse();
+    Ok(sessions)
+}
+
+fn session_preview(
+    state_dir: &std::path::Path,
+    session_id: Uuid,
+    preview_bytes: u64,
+) -> Result<(Option<String>, bool, Option<DateTime<Utc>>)> {
+    let path = logs_dir(state_dir).join(format!("{}.typescript", session_id));
+    if !path.exists() {
+        return Ok((None, false, None));
+    }
+    let metadata = std::fs::metadata(&path)?;
+    let modified = metadata.modified().ok().map(DateTime::<Utc>::from);
+    let len = metadata.len();
+    let take = preview_bytes.min(len);
+    let mut file = std::fs::File::open(&path)?;
+    use std::io::Seek;
+    if len > take {
+        file.seek(std::io::SeekFrom::Start(len - take))?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok((Some(BASE64_STANDARD.encode(bytes)), len > take, modified))
+}
+
+fn default_preview_bytes() -> u64 {
+    512 * 1024
+}
+
+fn ensure_session_dirs(state_dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(sessions_dir(state_dir))?;
+    std::fs::create_dir_all(logs_dir(state_dir))?;
+    std::fs::create_dir_all(sockets_dir(state_dir))?;
+    std::fs::create_dir_all(ssh_dir(state_dir))?;
+    Ok(())
+}
+
+fn sessions_dir(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("sessions")
+}
+
+fn logs_dir(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("logs")
+}
+
+fn sockets_dir(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("sockets")
+}
+
+fn ssh_dir(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("ssh")
+}
+
+fn sessions_socket_path(state_dir: &std::path::Path, id: Uuid) -> PathBuf {
+    sockets_dir(state_dir).join(id.to_string())
 }
 
 fn authenticated_user(
@@ -867,6 +1015,208 @@ fn save_profile(state: &AppState, user_id: &str, request: SyncPutRequest) -> Res
     Ok(next)
 }
 
+fn load_sync_v2(state: &AppState, user_id: &str) -> Result<HashMap<String, SyncServiceState>> {
+    let legacy = load_profile(state, user_id)?;
+    let mut services = default_sync_v2_from_legacy(&legacy);
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    let mut stmt = db.prepare(
+        "SELECT service, revision, payload, tombstones FROM sync_services WHERE user_id = ?1",
+    )?;
+    let rows = stmt.query_map([user_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (service, revision, payload, tombstones) = row?;
+        let state = SyncServiceState {
+            revision,
+            payload: serde_json::from_str(&payload)?,
+            tombstones: serde_json::from_str(&tombstones)?,
+        };
+        services.insert(service, state);
+    }
+    Ok(services)
+}
+
+fn save_sync_v2(
+    state: &AppState,
+    user_id: &str,
+    request: SyncV2PutRequest,
+) -> Result<HashMap<String, SyncServiceState>> {
+    validate_sync_service_names(request.services.keys())?;
+    let mut services = load_sync_v2(state, user_id)?;
+    for (service, put) in &request.services {
+        let current = services
+            .get(service)
+            .cloned()
+            .unwrap_or_else(|| default_service_state(service));
+        if current.revision != put.expected_revision {
+            bail!(
+                "revision conflict for {}: expected {}, current {}",
+                service,
+                put.expected_revision,
+                current.revision
+            );
+        }
+    }
+
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    let now = Utc::now().to_rfc3339();
+    for (service, put) in request.services {
+        let next = SyncServiceState {
+            revision: Uuid::new_v4().to_string(),
+            payload: put.payload,
+            tombstones: put.tombstones,
+        };
+        db.execute(
+            "INSERT INTO sync_services (user_id, service, revision, payload, tombstones, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(user_id, service) DO UPDATE SET
+               revision = excluded.revision,
+               payload = excluded.payload,
+               tombstones = excluded.tombstones,
+               updated_at = excluded.updated_at",
+            params![
+                user_id,
+                service,
+                next.revision,
+                serde_json::to_string(&next.payload)?,
+                serde_json::to_string(&next.tombstones)?,
+                now,
+            ],
+        )?;
+        services.insert(service, next);
+    }
+
+    save_legacy_profile_from_services(&db, user_id, &services)?;
+    audit_db(
+        &db,
+        "sync_v2_put",
+        Some(user_id),
+        json!({"services": services.keys().cloned().collect::<Vec<_>>()}),
+    )?;
+    Ok(services)
+}
+
+fn default_sync_v2_from_legacy(legacy: &SyncState) -> HashMap<String, SyncServiceState> {
+    let mut services = HashMap::new();
+    services.insert(
+        "hosts".to_string(),
+        SyncServiceState {
+            revision: legacy.revision.clone(),
+            payload: legacy
+                .profile
+                .get("hosts")
+                .cloned()
+                .unwrap_or_else(|| json!({"hosts": [], "groups": []})),
+            tombstones: default_tombstones(),
+        },
+    );
+    services.insert(
+        "settings".to_string(),
+        SyncServiceState {
+            revision: legacy.revision.clone(),
+            payload: legacy
+                .profile
+                .get("settings")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            tombstones: default_tombstones(),
+        },
+    );
+    services.insert(
+        "snippets".to_string(),
+        SyncServiceState {
+            revision: legacy.revision.clone(),
+            payload: legacy
+                .profile
+                .get("snippets")
+                .cloned()
+                .unwrap_or_else(|| json!({"snippets": []})),
+            tombstones: default_tombstones(),
+        },
+    );
+    services.insert(
+        "vault".to_string(),
+        SyncServiceState {
+            revision: legacy.revision.clone(),
+            payload: legacy.vault.clone(),
+            tombstones: default_tombstones(),
+        },
+    );
+    services
+}
+
+fn default_service_state(service: &str) -> SyncServiceState {
+    SyncServiceState {
+        revision: "0".to_string(),
+        payload: match service {
+            "hosts" => json!({"hosts": [], "groups": []}),
+            "settings" => json!({}),
+            "snippets" => json!({"snippets": []}),
+            "vault" => json!({"keys": []}),
+            _ => json!(null),
+        },
+        tombstones: default_tombstones(),
+    }
+}
+
+fn save_legacy_profile_from_services(
+    db: &Connection,
+    user_id: &str,
+    services: &HashMap<String, SyncServiceState>,
+) -> Result<()> {
+    let revision = Uuid::new_v4().to_string();
+    let profile = json!({
+        "hosts": services.get("hosts").map(|service| service.payload.clone()).unwrap_or_else(|| json!({"hosts": [], "groups": []})),
+        "settings": services.get("settings").map(|service| service.payload.clone()).unwrap_or_else(|| json!({})),
+        "snippets": services.get("snippets").map(|service| service.payload.clone()).unwrap_or_else(|| json!({"snippets": []})),
+    });
+    let vault = services
+        .get("vault")
+        .map(|service| service.payload.clone())
+        .unwrap_or_else(|| json!({"keys": []}));
+    db.execute(
+        "INSERT INTO profiles (user_id, revision, profile, vault, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(user_id) DO UPDATE SET revision = excluded.revision, profile = excluded.profile, vault = excluded.vault, updated_at = excluded.updated_at",
+        params![
+            user_id,
+            revision,
+            serde_json::to_string(&profile)?,
+            serde_json::to_string(&vault)?,
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_sync_service_names<'a>(services: impl Iterator<Item = &'a String>) -> Result<()> {
+    for service in services {
+        if !matches!(
+            service.as_str(),
+            "hosts" | "settings" | "snippets" | "vault"
+        ) {
+            bail!("unknown sync service: {}", service);
+        }
+    }
+    Ok(())
+}
+
+fn default_tombstones() -> Value {
+    json!([])
+}
+
 fn issue_tokens(db: &Connection, user_id: &str) -> Result<TokenResponse> {
     let access_token = random_token();
     let refresh_token = random_token();
@@ -927,6 +1277,42 @@ fn validate_authorize_query(query: &AuthorizeQuery) -> Result<()> {
     Ok(())
 }
 
+fn admin_continue_url(params: &HashMap<String, String>) -> Option<String> {
+    let query = AuthorizeQuery {
+        response_type: params.get("response_type")?.clone(),
+        client_id: params.get("client_id")?.clone(),
+        redirect_uri: params.get("redirect_uri")?.clone(),
+        code_challenge: params.get("code_challenge")?.clone(),
+        code_challenge_method: params.get("code_challenge_method")?.clone(),
+        state: params.get("state")?.clone(),
+    };
+    validate_authorize_query(&query).ok()?;
+    Some(authorize_path("/oauth/authorize", &query))
+}
+
+fn authorize_path(path: &str, query: &AuthorizeQuery) -> String {
+    format!(
+        "{}?response_type={}&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method={}&state={}",
+        path,
+        urlencoding::encode(&query.response_type),
+        urlencoding::encode(&query.client_id),
+        urlencoding::encode(&query.redirect_uri),
+        urlencoding::encode(&query.code_challenge),
+        urlencoding::encode(&query.code_challenge_method),
+        urlencoding::encode(&query.state)
+    )
+}
+
+fn continue_button_html(continue_url: &str) -> String {
+    if continue_url.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<a class="button-link" href="{}">Continue to sign in</a>"#,
+        html_escape(continue_url)
+    )
+}
+
 fn validate_username(username: &str) -> Result<()> {
     let username = username.trim();
     if username.len() < 2 || username.len() > 64 {
@@ -941,125 +1327,90 @@ fn validate_username(username: &str) -> Result<()> {
     Ok(())
 }
 
-fn apply_passkey_client_preferences(public_key: &mut Value, is_registration: bool) {
-    let Some(options) = public_key
-        .get_mut("publicKey")
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    options.insert(
-        "hints".to_string(),
-        json!(["client-device", "security-key"]),
-    );
-    if is_registration {
-        let authenticator_selection = options
-            .entry("authenticatorSelection")
-            .or_insert_with(|| json!({}));
-        if let Some(selection) = authenticator_selection.as_object_mut() {
-            selection.insert("residentKey".to_string(), json!("preferred"));
-            selection.insert("requireResidentKey".to_string(), json!(false));
-        }
+fn validate_password(password: &str) -> Result<()> {
+    if password.len() < MIN_PASSWORD_LEN {
+        bail!("password must be at least {} characters", MIN_PASSWORD_LEN);
     }
-}
-
-fn webauthn(state: &AppState) -> Result<Webauthn> {
-    webauthn_for_public_url(&state.public_url)
-}
-
-fn webauthn_for_public_url(public_url: &str) -> Result<Webauthn> {
-    let origin = Url::parse(public_url.trim_end_matches('/'))?;
-    let host = origin
-        .host_str()
-        .ok_or_else(|| anyhow!("Portal Hub public URL must include a host"))?;
-    if origin.scheme() != "https" && !is_local_passkey_host(host) {
-        bail!("passkeys require https, except localhost development domains");
+    if password.len() > 256 {
+        bail!("password must be 256 characters or fewer");
     }
-    let builder = WebauthnBuilder::new(host, &origin)?
-        .rp_name("Portal Hub")
-        .allow_any_port(true);
-    Ok(builder.build()?)
+    Ok(())
 }
 
-fn is_local_passkey_host(host: &str) -> bool {
-    host == "localhost" || host.ends_with(".localhost")
-}
-
-fn insert_user(db: &Connection, user_id: Uuid, username: &str) -> Result<()> {
+fn insert_user(db: &Connection, user_id: Uuid, username: &str, password_hash: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    if legacy_user_auth_columns(db)? {
+    if user_table_has_column(db, "totp_secret")? {
         db.execute(
-            "INSERT INTO users (id, username, password_hash, totp_secret, created_at) VALUES (?1, ?2, '', '', ?3)",
-            params![user_id.to_string(), username.trim(), now],
+            "INSERT INTO users (id, username, password_hash, totp_secret, created_at) VALUES (?1, ?2, ?3, '', ?4)",
+            params![user_id.to_string(), username.trim(), password_hash, now],
         )?;
     } else {
         db.execute(
-            "INSERT INTO users (id, username, created_at) VALUES (?1, ?2, ?3)",
-            params![user_id.to_string(), username.trim(), now],
+            "INSERT INTO users (id, username, password_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id.to_string(), username.trim(), password_hash, now],
         )?;
     }
     Ok(())
 }
 
-fn legacy_user_auth_columns(db: &Connection) -> Result<bool> {
+fn ensure_password_hash_column(db: &Connection) -> Result<()> {
+    if !user_table_has_column(db, "password_hash")? {
+        db.execute(
+            "ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn user_table_has_column(db: &Connection, name: &str) -> Result<bool> {
     let mut statement = db.prepare("PRAGMA table_info(users)")?;
     let mut rows = statement.query([])?;
-    let mut has_password_hash = false;
-    let mut has_totp_secret = false;
     while let Some(row) = rows.next()? {
         let column_name: String = row.get(1)?;
-        has_password_hash |= column_name == "password_hash";
-        has_totp_secret |= column_name == "totp_secret";
-    }
-    Ok(has_password_hash && has_totp_secret)
-}
-
-fn insert_passkey(db: &Connection, user_id: Uuid, passkey: &Passkey) -> Result<()> {
-    db.execute(
-        "INSERT INTO passkeys (id, user_id, passkey, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![
-            Uuid::new_v4().to_string(),
-            user_id.to_string(),
-            serde_json::to_string(passkey)?,
-            Utc::now().to_rfc3339()
-        ],
-    )?;
-    Ok(())
-}
-
-fn update_passkey(db: &Connection, passkey_id: &str, passkey: &Passkey) -> Result<()> {
-    db.execute(
-        "UPDATE passkeys SET passkey = ?1 WHERE id = ?2",
-        params![serde_json::to_string(passkey)?, passkey_id],
-    )?;
-    Ok(())
-}
-
-fn load_passkeys_for_user(db: &Connection, user_id: &str) -> Result<Vec<(String, Passkey)>> {
-    let mut statement = db.prepare("SELECT id, passkey FROM passkeys WHERE user_id = ?1")?;
-    let rows = statement.query_map([user_id], |row| {
-        let id: String = row.get(0)?;
-        let passkey_json: String = row.get(1)?;
-        Ok((id, passkey_json))
-    })?;
-    let mut passkeys = Vec::new();
-    for row in rows {
-        let (id, passkey_json) = row?;
-        passkeys.push((id, serde_json::from_str(&passkey_json)?));
-    }
-    Ok(passkeys)
-}
-
-fn ensure_credential_is_unique(db: &Connection, passkey: &Passkey) -> Result<()> {
-    let mut statement = db.prepare("SELECT passkey FROM passkeys")?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-    for row in rows {
-        let existing: Passkey = serde_json::from_str(&row?)?;
-        if existing.cred_id() == passkey.cred_id() {
-            bail!("this passkey is already registered");
+        if column_name == name {
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
+}
+
+fn owner_missing_password(state: &AppState) -> Result<Option<String>> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    let mut statement = db.prepare("SELECT username, COALESCE(password_hash, '') FROM users")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut missing = None;
+    for row in rows {
+        let (username, password_hash) = row?;
+        if password_hash.is_empty() {
+            if missing.is_some() {
+                return Ok(None);
+            }
+            missing = Some(username);
+        }
+    }
+    Ok(missing)
+}
+
+fn hash_password(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Ok(Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|error| anyhow!("failed to hash password: {}", error))?
+        .to_string())
+}
+
+fn verify_password(password: &str, password_hash: &str) -> Result<bool> {
+    let parsed_hash = PasswordHash::new(password_hash)
+        .map_err(|error| anyhow!("stored password hash is invalid: {}", error))?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .is_ok())
 }
 
 fn pkce_challenge(verifier: &str) -> String {
@@ -1074,6 +1425,12 @@ fn random_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn audit(state: &AppState, event: &str, user_id: &str, detail: Value) {
+    if let Ok(db) = state.db.lock() {
+        let _ = audit_db(&db, event, Some(user_id), detail);
+    }
 }
 
 fn audit_db(db: &Connection, event: &str, user_id: Option<&str>, detail: Value) -> Result<()> {
@@ -1265,6 +1622,20 @@ fn page(title: &str, body: &str) -> String {
               border-color: var(--line-strong);
               color: var(--text);
             }}
+            .button-link {{
+              display: grid;
+              place-items: center;
+              width: 100%;
+              min-height: 48px;
+              margin-top: 22px;
+              border: 1px solid rgba(99, 210, 255, 0.4);
+              border-radius: 7px;
+              background: var(--accent);
+              color: #061017;
+              font: 800 15px / 1 system-ui, sans-serif;
+              text-decoration: none;
+            }}
+            .button-link:hover {{ filter: brightness(1.04); }}
             .actions {{
               display: grid;
               grid-template-columns: 1fr 1fr;
@@ -1298,7 +1669,7 @@ fn page(title: &str, body: &str) -> String {
               flex: 1;
               background: var(--line);
             }}
-            .passkey-callout {{
+            .security-callout {{
               display: grid;
               grid-template-columns: 42px 1fr;
               gap: 14px;
@@ -1310,27 +1681,23 @@ fn page(title: &str, body: &str) -> String {
               background: var(--surface-2);
               color: var(--muted);
             }}
-            .passkey-callout strong {{
+            .security-callout strong {{
               display: block;
               color: var(--text);
               margin-bottom: 5px;
             }}
-            .passkey-callout p {{ margin: 0; line-height: 1.45; }}
-            .passkey-callout.compact {{
-              grid-template-columns: 32px 1fr;
-              font-size: 14px;
-            }}
-            .passkey-icon {{
+            .security-callout p {{ margin: 0; line-height: 1.45; }}
+            .security-icon {{
               width: 42px;
               height: 42px;
               border-radius: 8px;
               border: 1px solid rgba(155, 229, 100, 0.35);
               background:
                 linear-gradient(135deg, rgba(155, 229, 100, 0.2), rgba(99, 210, 255, 0.08)),
-                #0c1219;
+              #0c1219;
               position: relative;
             }}
-            .passkey-icon::before {{
+            .security-icon::before {{
               content: "";
               position: absolute;
               left: 13px;
@@ -1340,7 +1707,7 @@ fn page(title: &str, body: &str) -> String {
               border: 2px solid var(--accent-2);
               border-radius: 50%;
             }}
-            .passkey-icon::after {{
+            .security-icon::after {{
               content: "";
               position: absolute;
               left: 20px;
@@ -1394,11 +1761,11 @@ fn page(title: &str, body: &str) -> String {
         </html>"#,
         html_escape(PORTAL_ASCII_LOGO),
         body,
-        passkey_script()
+        password_script()
     )
 }
 
-fn passkey_script() -> &'static str {
+fn password_script() -> &'static str {
     r#"
       function showError(id, message) {
         const node = document.getElementById(id);
@@ -1411,60 +1778,6 @@ fn passkey_script() -> &'static str {
         if (!node) return;
         node.textContent = "";
         node.hidden = true;
-      }
-      function b64urlToBuffer(value) {
-        const base64 = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
-        const binary = atob(base64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        return bytes.buffer;
-      }
-      function bufferToB64url(buffer) {
-        const bytes = new Uint8Array(buffer);
-        let binary = "";
-        for (const byte of bytes) binary += String.fromCharCode(byte);
-        return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-      }
-      function creationOptionsFromJSON(options) {
-        options = options.publicKey || options;
-        options.challenge = b64urlToBuffer(options.challenge);
-        options.user.id = b64urlToBuffer(options.user.id);
-        if (options.excludeCredentials) {
-          options.excludeCredentials = options.excludeCredentials.map((credential) => ({
-            ...credential,
-            id: b64urlToBuffer(credential.id),
-          }));
-        }
-        return options;
-      }
-      function requestOptionsFromJSON(options) {
-        options = options.publicKey || options;
-        options.challenge = b64urlToBuffer(options.challenge);
-        if (options.allowCredentials) {
-          options.allowCredentials = options.allowCredentials.map((credential) => ({
-            ...credential,
-            id: b64urlToBuffer(credential.id),
-          }));
-        }
-        return options;
-      }
-      function credentialToJSON(credential) {
-        const response = credential.response;
-        const json = {
-          id: credential.id,
-          rawId: bufferToB64url(credential.rawId),
-          type: credential.type,
-          response: {
-            clientDataJSON: bufferToB64url(response.clientDataJSON),
-          },
-        };
-        if (response.attestationObject) json.response.attestationObject = bufferToB64url(response.attestationObject);
-        if (response.authenticatorData) json.response.authenticatorData = bufferToB64url(response.authenticatorData);
-        if (response.signature) json.response.signature = bufferToB64url(response.signature);
-        if (response.userHandle) json.response.userHandle = bufferToB64url(response.userHandle);
-        if (typeof response.getTransports === "function") json.response.transports = response.getTransports();
-        if (credential.getClientExtensionResults) json.extensions = credential.getClientExtensionResults();
-        return json;
       }
       async function postJSON(url, body) {
         const response = await fetch(url, {
@@ -1484,70 +1797,83 @@ fn passkey_script() -> &'static str {
           node.classList.toggle("active", node.dataset.stepDot === String(step));
         });
       }
+      function ownerSetupSuccessHTML(continueUrl) {
+        const lead = continueUrl
+          ? "Continue to sign in with the password you just created."
+          : "Return to Portal and sign in to Portal Hub.";
+        const action = continueUrl
+          ? `<a class="button-link" href="${continueUrl}">Continue to sign in</a>`
+          : "";
+        return `<p class="eyebrow">Owner ready</p><h1>Password saved.</h1><p class="lead">${lead}</p>${action}`;
+      }
       function initOwnerWizard() {
         const form = document.getElementById("owner-form");
         const username = document.getElementById("username");
+        const password = document.getElementById("password");
+        const confirmation = document.getElementById("password-confirm");
         const next = document.getElementById("next-button");
         const back = document.getElementById("back-button");
         const submit = document.getElementById("create-button");
-        if (!form || !username || !next || !back || !submit) return;
-        next.addEventListener("click", () => {
-          clearError("setup-error");
-          if (!username.reportValidity()) return;
-          setSetupStep(2);
-          submit.focus();
-        });
-        back.addEventListener("click", () => {
-          clearError("setup-error");
-          setSetupStep(1);
-          username.focus();
-        });
+        if (!form || !username || !password || !confirmation || !submit) return;
+        if (next && back) {
+          next.addEventListener("click", () => {
+            clearError("setup-error");
+            if (!username.reportValidity()) return;
+            setSetupStep(2);
+            password.focus();
+          });
+          back.addEventListener("click", () => {
+            clearError("setup-error");
+            setSetupStep(1);
+            username.focus();
+          });
+        }
         form.addEventListener("submit", async (event) => {
           event.preventDefault();
           clearError("setup-error");
+          if (!username.reportValidity() || !password.reportValidity() || !confirmation.reportValidity()) return;
+          if (password.value !== confirmation.value) {
+            showError("setup-error", "Passwords do not match");
+            confirmation.focus();
+            return;
+          }
           submit.disabled = true;
-          submit.textContent = "Waiting for passkey...";
+          const originalText = submit.textContent;
+          submit.textContent = "Saving...";
           try {
-            const start = await postJSON("/webauthn/register/start", { username: username.value });
-            const credential = await navigator.credentials.create({ publicKey: creationOptionsFromJSON(start.public_key) });
-            await postJSON("/webauthn/register/finish", {
-              flow_id: start.flow_id,
-              credential: credentialToJSON(credential),
-            });
+            await postJSON("/auth/register", { username: username.value, password: password.value });
             document.querySelector(".setup-panel").innerHTML =
-              '<p class="eyebrow">Owner created</p><h1>Passkey enrolled.</h1><p class="lead">Return to Portal and sign in to Portal Hub.</p>';
+              ownerSetupSuccessHTML(form.dataset.continueUrl || "");
           } catch (error) {
             showError("setup-error", error.message || String(error));
           } finally {
             submit.disabled = false;
-            submit.textContent = "Create passkey";
+            submit.textContent = originalText;
           }
         });
       }
-      function initPasskeyLogin() {
+      function initPasswordLogin() {
         const form = document.getElementById("login-form");
         const username = document.getElementById("username");
+        const password = document.getElementById("password");
         const submit = document.getElementById("login-button");
-        if (!form || !username || !submit) return;
+        if (!form || !username || !password || !submit) return;
         form.addEventListener("submit", async (event) => {
           event.preventDefault();
           clearError("login-error");
+          if (!username.reportValidity() || !password.reportValidity()) return;
           submit.disabled = true;
-          submit.textContent = "Waiting for passkey...";
+          const originalText = submit.textContent;
+          submit.textContent = "Signing in...";
           try {
             const oauth = Object.fromEntries(new URLSearchParams(window.location.search).entries());
-            const start = await postJSON("/webauthn/login/start", { username: username.value, oauth });
-            const credential = await navigator.credentials.get({ publicKey: requestOptionsFromJSON(start.public_key) });
-            const finish = await postJSON("/webauthn/login/finish", {
-              flow_id: start.flow_id,
-              credential: credentialToJSON(credential),
-            });
+            const finish = await postJSON("/auth/login", { username: username.value, password: password.value, oauth });
             window.location.assign(finish.redirect_uri);
           } catch (error) {
             showError("login-error", error.message || String(error));
           } finally {
             submit.disabled = false;
-            submit.textContent = "Sign in with passkey";
+            submit.textContent = originalText;
           }
         });
       }
@@ -1555,7 +1881,7 @@ fn passkey_script() -> &'static str {
         initOwnerWizard();
       }
       if (document.getElementById("login-form")) {
-        initPasskeyLogin();
+        initPasswordLogin();
       }
     "#
 }
@@ -1566,4 +1892,193 @@ fn html_escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        let db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        AppState {
+            db: Arc::new(Mutex::new(db)),
+            state_dir: std::env::temp_dir().join(format!("portal-hub-test-{}", Uuid::new_v4())),
+            public_url: "http://portal-hub.localhost:8080".to_string(),
+            ssh_port: 2222,
+        }
+    }
+
+    fn test_oauth() -> AuthorizeQuery {
+        AuthorizeQuery {
+            response_type: "code".to_string(),
+            client_id: CLIENT_ID.to_string(),
+            redirect_uri: "http://127.0.0.1:49152/callback".to_string(),
+            code_challenge: "abcdefghijklmnopqrstuvwxyz123456".to_string(),
+            code_challenge_method: "S256".to_string(),
+            state: "state-state-state".to_string(),
+        }
+    }
+
+    #[test]
+    fn password_hash_verifies_only_original_password() {
+        let hash = hash_password("correct horse battery staple").unwrap();
+
+        assert!(verify_password("correct horse battery staple", &hash).unwrap());
+        assert!(!verify_password("wrong horse battery staple", &hash).unwrap());
+    }
+
+    #[test]
+    fn password_login_issues_oauth_redirect() {
+        let state = test_state();
+        register_inner(
+            &state,
+            RegisterRequest {
+                username: "owner".to_string(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
+        .unwrap();
+
+        let response = login_inner(
+            &state,
+            LoginRequest {
+                username: "owner".to_string(),
+                password: "correct horse battery staple".to_string(),
+                oauth: test_oauth(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            response
+                .redirect_uri
+                .starts_with("http://127.0.0.1:49152/callback?code=")
+        );
+        assert!(response.redirect_uri.contains("&state=state-state-state"));
+    }
+
+    #[test]
+    fn admin_continue_url_preserves_valid_oauth_query() {
+        let query = test_oauth();
+        let params = HashMap::from([
+            ("response_type".to_string(), query.response_type),
+            ("client_id".to_string(), query.client_id),
+            ("redirect_uri".to_string(), query.redirect_uri),
+            ("code_challenge".to_string(), query.code_challenge),
+            (
+                "code_challenge_method".to_string(),
+                query.code_challenge_method,
+            ),
+            ("state".to_string(), query.state),
+        ]);
+
+        let continue_url = admin_continue_url(&params).unwrap();
+
+        assert!(continue_url.starts_with("/oauth/authorize?"));
+        assert!(continue_url.contains("client_id=portal-desktop"));
+        assert!(continue_url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A49152%2Fcallback"));
+    }
+
+    #[test]
+    fn owner_registration_supports_legacy_totp_column() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            r#"
+            CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                totp_secret TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        init_db(&db).unwrap();
+        let state = AppState {
+            db: Arc::new(Mutex::new(db)),
+            state_dir: std::env::temp_dir().join(format!("portal-hub-test-{}", Uuid::new_v4())),
+            public_url: "http://portal-hub.localhost:8080".to_string(),
+            ssh_port: 2222,
+        };
+
+        register_inner(
+            &state,
+            RegisterRequest {
+                username: "owner".to_string(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
+        .unwrap();
+
+        let db = state.db.lock().unwrap();
+        let (password_hash, totp_secret): (String, String) = db
+            .query_row(
+                "SELECT password_hash, totp_secret FROM users WHERE username = 'owner'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!password_hash.is_empty());
+        assert!(totp_secret.is_empty());
+    }
+
+    #[test]
+    fn sync_v2_defaults_to_service_payloads() {
+        let state = test_state();
+        let services = load_sync_v2(&state, "user-1").unwrap();
+
+        assert_eq!(services.get("hosts").unwrap().revision, "0");
+        assert!(
+            services
+                .get("hosts")
+                .unwrap()
+                .payload
+                .get("hosts")
+                .is_some()
+        );
+        assert!(services.get("settings").unwrap().payload.is_object());
+        assert!(
+            services
+                .get("snippets")
+                .unwrap()
+                .payload
+                .get("snippets")
+                .is_some()
+        );
+        assert!(services.get("vault").unwrap().payload.get("keys").is_some());
+    }
+
+    #[test]
+    fn sync_v2_updates_one_service_and_rejects_stale_revision() {
+        let state = test_state();
+        let mut services = HashMap::new();
+        services.insert(
+            "hosts".to_string(),
+            SyncV2ServicePut {
+                expected_revision: "0".to_string(),
+                payload: json!({"hosts": [{"id": "host-1"}], "groups": []}),
+                tombstones: json!([]),
+            },
+        );
+
+        let updated = save_sync_v2(&state, "user-1", SyncV2PutRequest { services }).unwrap();
+        let revision = updated.get("hosts").unwrap().revision.clone();
+        assert_ne!(revision, "0");
+
+        let mut stale = HashMap::new();
+        stale.insert(
+            "hosts".to_string(),
+            SyncV2ServicePut {
+                expected_revision: "0".to_string(),
+                payload: json!({"hosts": [], "groups": []}),
+                tombstones: json!([]),
+            },
+        );
+        let error = save_sync_v2(&state, "user-1", SyncV2PutRequest { services: stale })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("revision conflict for hosts"));
+    }
 }

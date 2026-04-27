@@ -44,14 +44,10 @@ For account-based desktop sync, run the optional web server:
 portal-hub web --bind 127.0.0.1:8080 --public-url https://hub.example.test
 ```
 
-On first visit, `/admin` creates the owner account with a passkey. Portal
+On first visit, `/admin` creates the owner account with a password. Portal
 desktop signs in through the system browser with OAuth authorization code +
-PKCE, then stores Hub tokens in the OS keychain. Passkeys provide the user
-verification step; Portal Hub does not store user passwords.
-
-For local passkey testing, prefer `http://portal-hub.localhost:8080` over bare
-`localhost` because some passkey providers reject `localhost` as an account
-domain.
+PKCE, then stores Hub tokens in the OS keychain. Portal Hub stores only an
+Argon2 password hash.
 
 ## Session Logs
 
@@ -155,14 +151,18 @@ sudo -u portal-hub portal-hub prune --ended-older-than-days 14 --max-log-bytes 1
 
 ## Portal Configuration
 
-In Portal settings, enable Portal Hub and configure:
+In Portal settings, start the Portal Hub onboarding wizard and configure:
 
-- Host: the proxy Tailscale DNS name or Tailscale IP
-- Port: `2222` unless you installed with a custom `PORTAL_HUB_SSH_PORT`
-- Username: `portal-hub`
-- Identity file: the private key matching the forced-command public key
+- Host: the Portal Hub DNS name or IP, for example `portal-hub.localhost`
+- Web port: `8080` unless you installed the web service on another port
 
-Then enable Portal Hub per SSH host.
+Portal opens the Hub OAuth page in your browser. After sign-in, choose which
+services to enable: hosts sync, settings sync, snippets sync, key vault, and
+persistent sessions / proxy.
+
+Desktop sync and session listing use the OAuth web API. Persistent proxy
+sessions continue to use the SSH forced-command connection with local
+`ssh-agent` forwarding.
 
 ## JSON API
 

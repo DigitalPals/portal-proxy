@@ -12,6 +12,7 @@ categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0"
+argon2 = "0.5"
 axum = "0.7"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
@@ -27,7 +28,6 @@ tower-http = { version = "0.6", features = ["trace"] }
 url = "2.5"
 urlencoding = "2.1"
 uuid = { version = "1.10", features = ["v4", "serde"] }
-webauthn-rs = { version = "0.5.4", default-features = false }
 
 [dev-dependencies]
 portable-pty = "0.8"

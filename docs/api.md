@@ -1,7 +1,8 @@
 # Portal Hub API
 
-Portal Hub is executed over SSH forced commands. New clients should request
-versioned JSON responses and reject unknown API versions.
+Portal Hub exposes OAuth-authenticated web APIs for Portal desktop. The legacy
+SSH forced-command CLI remains available for deployments and compatibility.
+Clients should request versioned JSON responses and reject unknown API versions.
 
 ## Version
 
@@ -105,7 +106,7 @@ portal-hub web --bind 127.0.0.1:8080 --public-url https://hub.example.test
 ```
 
 When no user exists, `GET /admin` presents the one-time owner setup wizard. The
-wizard asks for an account name, then starts a passkey registration ceremony.
+wizard asks for an account name and password.
 
 Portal desktop authenticates with OAuth authorization code + PKCE:
 
@@ -114,20 +115,38 @@ GET /oauth/authorize?response_type=code&client_id=portal-desktop&redirect_uri=ht
 POST /oauth/token
 ```
 
-The browser page served by `GET /oauth/authorize` signs the user in with a
-passkey before issuing the OAuth authorization code.
+The browser page served by `GET /oauth/authorize` signs the user in with the
+owner password before issuing the OAuth authorization code.
 
 The token response contains a bearer `access_token` and `refresh_token`.
 Authenticated clients can call:
 
 ```text
+GET /api/info
 GET /api/me
 GET /api/sync
 PUT /api/sync
+GET /api/sync/v2
+PUT /api/sync/v2
+GET /api/sessions
 ```
+
+`GET /api/info` is public metadata for desktop onboarding. It returns the Hub
+version, public URL, and capability flags so clients can derive OAuth and proxy
+settings from a host plus web port.
 
 `PUT /api/sync` accepts `expected_revision`, `profile`, and `vault`. A stale
 revision returns HTTP `409 Conflict`.
+
+`/api/sync/v2` stores independent service payloads for `hosts`, `settings`,
+`snippets`, and `vault`. Each service has its own `revision`, `payload`, and
+`tombstones` array. `PUT /api/sync/v2` accepts a `services` object whose values
+contain `expected_revision`, `payload`, and optional `tombstones`; stale service
+revisions return HTTP `409 Conflict`.
+
+`GET /api/sessions` requires a bearer token and returns the versioned session
+list used by Portal's active-session picker. `active=true`, `include_preview`,
+and `preview_bytes` are supported query parameters.
 
 ## Attach
 
