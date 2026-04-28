@@ -183,7 +183,10 @@ Portal Hub is designed for Tailscale-only access.
 - Keep the legacy SSH forced-command entry restricted if you enable it.
 
 Portal Hub can sync encrypted vault blobs, but it must never receive the vault
-passphrase, derived key, or decrypted private keys.
+passphrase, derived key, or decrypted private keys. Android vault enrollment
+keeps that model: Hub stores an Android device public key and an encrypted
+unlock-key envelope produced by Portal desktop, but not the plaintext unlock
+key.
 
 ## Session Logs And Retention
 

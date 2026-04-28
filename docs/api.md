@@ -129,6 +129,10 @@ PUT /api/sync
 GET /api/sync/v2
 PUT /api/sync/v2
 GET /api/sync/v2/events
+GET /api/vault/enrollments
+POST /api/vault/enrollments
+GET /api/vault/enrollments/{id}
+POST /api/vault/enrollments/{id}/approve
 GET /api/sessions
 GET /api/sessions/terminal
 ```
@@ -148,7 +152,8 @@ Example:
     "sync_v2": true,
     "sync_events": true,
     "web_proxy": true,
-    "key_vault": true
+    "key_vault": true,
+    "vault_enrollment": true
   },
   "ssh_port": 2222,
   "ssh_username": "portal-hub"
@@ -167,6 +172,17 @@ revisions return HTTP `409 Conflict`.
 `GET /api/sync/v2/events` is a bearer-authenticated SSE stream. It emits `sync`
 events with the latest service revision map so Portal can run background sync
 after another device updates the Hub.
+
+Vault enrollment lets a new device obtain the existing vault unlock key without
+Hub seeing that key. Android creates an RSA public/private key pair and calls
+`POST /api/vault/enrollments` with `device_name`,
+`public_key_algorithm: "RSA-OAEP-SHA256"`, and `public_key_der_base64`.
+Portal desktop lists pending requests with `GET /api/vault/enrollments`, reads
+the vault unlock key from its OS keychain, encrypts it to the device public key,
+and calls `POST /api/vault/enrollments/{id}/approve` with
+`encrypted_secret_base64`. Android polls `GET /api/vault/enrollments/{id}`,
+decrypts the envelope locally, and stores the unlock key in Android Keystore.
+Hub stores only public keys, request status, and encrypted envelopes.
 
 `GET /api/sessions` requires a bearer token and returns the versioned session
 list used by Portal's active-session picker. `active=true`, `include_preview`,

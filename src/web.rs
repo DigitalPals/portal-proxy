@@ -14,7 +14,7 @@ use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::Router;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Json, Query, State};
+use axum::extract::{Json, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -64,6 +64,36 @@ struct AppState {
     public_url: String,
     ssh_port: u16,
     sync_events: broadcast::Sender<SyncRevisionEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VaultEnrollmentCreateRequest {
+    device_name: String,
+    public_key_algorithm: String,
+    public_key_der_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VaultEnrollmentApproveRequest {
+    encrypted_secret_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VaultEnrollmentListQuery {
+    status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VaultEnrollment {
+    id: String,
+    device_name: String,
+    public_key_algorithm: String,
+    public_key_der_base64: String,
+    status: String,
+    encrypted_secret_base64: Option<String>,
+    created_at: String,
+    updated_at: String,
+    approved_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -266,6 +296,15 @@ async fn run_async(
         .route("/api/sync", get(api_sync_get).put(api_sync_put))
         .route("/api/sync/v2", get(api_sync_v2_get).put(api_sync_v2_put))
         .route("/api/sync/v2/events", get(api_sync_v2_events))
+        .route(
+            "/api/vault/enrollments",
+            get(api_vault_enrollments).post(api_vault_enrollment_create),
+        )
+        .route("/api/vault/enrollments/:id", get(api_vault_enrollment_get))
+        .route(
+            "/api/vault/enrollments/:id/approve",
+            post(api_vault_enrollment_approve),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -328,6 +367,18 @@ fn init_db(db: &Connection) -> Result<()> {
             event TEXT NOT NULL,
             user_id TEXT,
             detail TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS vault_enrollments (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            device_name TEXT NOT NULL,
+            public_key_algorithm TEXT NOT NULL,
+            public_key_der_base64 TEXT NOT NULL,
+            encrypted_secret_base64 TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            approved_at TEXT
         );
         "#,
     )?;
@@ -728,7 +779,8 @@ async fn api_info(State(state): State<AppState>) -> Response {
             "sync_v2": true,
             "sync_events": true,
             "web_proxy": true,
-            "key_vault": true
+            "key_vault": true,
+            "vault_enrollment": true
         },
         "ssh_port": state.ssh_port,
         "ssh_username": "portal-hub",
@@ -1183,6 +1235,74 @@ async fn api_sync_v2_events(State(state): State<AppState>, headers: HeaderMap) -
         .into_response()
 }
 
+async fn api_vault_enrollment_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<VaultEnrollmentCreateRequest>,
+) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match create_vault_enrollment(&state, &user_id, request) {
+        Ok(enrollment) => Json(enrollment).into_response(),
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn api_vault_enrollments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<VaultEnrollmentListQuery>,
+) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match list_vault_enrollments(&state, &user_id, query.status.as_deref()) {
+        Ok(enrollments) => Json(json!({ "enrollments": enrollments })).into_response(),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+async fn api_vault_enrollment_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match load_vault_enrollment(&state, &user_id, &id) {
+        Ok(Some(enrollment)) => Json(enrollment).into_response(),
+        Ok(None) => json_error(
+            StatusCode::NOT_FOUND,
+            anyhow!("vault enrollment was not found"),
+        ),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+async fn api_vault_enrollment_approve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<VaultEnrollmentApproveRequest>,
+) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match approve_vault_enrollment(&state, &user_id, &id, request) {
+        Ok(enrollment) => Json(enrollment).into_response(),
+        Err(error) if error.to_string().contains("not found") => {
+            json_error(StatusCode::NOT_FOUND, error)
+        }
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error),
+    }
+}
+
 fn listed_sessions(
     state_dir: &std::path::Path,
     query: SessionsQuery,
@@ -1512,6 +1632,155 @@ fn save_sync_v2(
         json!({"services": services.keys().cloned().collect::<Vec<_>>()}),
     )?;
     Ok(services)
+}
+
+fn create_vault_enrollment(
+    state: &AppState,
+    user_id: &str,
+    request: VaultEnrollmentCreateRequest,
+) -> Result<VaultEnrollment> {
+    let device_name = request.device_name.trim();
+    if device_name.is_empty() || device_name.len() > 100 {
+        bail!("device_name must be between 1 and 100 characters");
+    }
+    if request.public_key_algorithm != "RSA-OAEP-SHA256" {
+        bail!("unsupported vault enrollment public key algorithm");
+    }
+    BASE64_STANDARD
+        .decode(request.public_key_der_base64.as_bytes())
+        .context("public_key_der_base64 is not valid base64")?;
+
+    let now = Utc::now().to_rfc3339();
+    let enrollment = VaultEnrollment {
+        id: Uuid::new_v4().to_string(),
+        device_name: device_name.to_string(),
+        public_key_algorithm: request.public_key_algorithm,
+        public_key_der_base64: request.public_key_der_base64,
+        status: "pending".to_string(),
+        encrypted_secret_base64: None,
+        created_at: now.clone(),
+        updated_at: now,
+        approved_at: None,
+    };
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    db.execute(
+        "INSERT INTO vault_enrollments
+         (id, user_id, device_name, public_key_algorithm, public_key_der_base64, encrypted_secret_base64, status, created_at, updated_at, approved_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, NULL)",
+        params![
+            enrollment.id,
+            user_id,
+            enrollment.device_name,
+            enrollment.public_key_algorithm,
+            enrollment.public_key_der_base64,
+            enrollment.status,
+            enrollment.created_at,
+            enrollment.updated_at,
+        ],
+    )?;
+    audit_db(
+        &db,
+        "vault_enrollment_create",
+        Some(user_id),
+        json!({"enrollment_id": enrollment.id, "device_name": enrollment.device_name}),
+    )?;
+    Ok(enrollment)
+}
+
+fn list_vault_enrollments(
+    state: &AppState,
+    user_id: &str,
+    status: Option<&str>,
+) -> Result<Vec<VaultEnrollment>> {
+    let status = status.unwrap_or("pending");
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    let mut stmt = db.prepare(
+        "SELECT id, device_name, public_key_algorithm, public_key_der_base64, status,
+                encrypted_secret_base64, created_at, updated_at, approved_at
+         FROM vault_enrollments
+         WHERE user_id = ?1 AND status = ?2
+         ORDER BY created_at DESC",
+    )?;
+    let rows = stmt.query_map(params![user_id, status], vault_enrollment_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn load_vault_enrollment(
+    state: &AppState,
+    user_id: &str,
+    id: &str,
+) -> Result<Option<VaultEnrollment>> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    db.query_row(
+        "SELECT id, device_name, public_key_algorithm, public_key_der_base64, status,
+                encrypted_secret_base64, created_at, updated_at, approved_at
+         FROM vault_enrollments
+         WHERE user_id = ?1 AND id = ?2",
+        params![user_id, id],
+        vault_enrollment_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn approve_vault_enrollment(
+    state: &AppState,
+    user_id: &str,
+    id: &str,
+    request: VaultEnrollmentApproveRequest,
+) -> Result<VaultEnrollment> {
+    BASE64_STANDARD
+        .decode(request.encrypted_secret_base64.as_bytes())
+        .context("encrypted_secret_base64 is not valid base64")?;
+    let existing = load_vault_enrollment(state, user_id, id)?
+        .ok_or_else(|| anyhow!("vault enrollment was not found"))?;
+    if existing.status != "pending" {
+        bail!("vault enrollment is already {}", existing.status);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    db.execute(
+        "UPDATE vault_enrollments
+         SET encrypted_secret_base64 = ?1, status = 'approved', updated_at = ?2, approved_at = ?2
+         WHERE user_id = ?3 AND id = ?4 AND status = 'pending'",
+        params![request.encrypted_secret_base64, now, user_id, id],
+    )?;
+    audit_db(
+        &db,
+        "vault_enrollment_approve",
+        Some(user_id),
+        json!({"enrollment_id": id}),
+    )?;
+    drop(db);
+    load_vault_enrollment(state, user_id, id)?
+        .ok_or_else(|| anyhow!("vault enrollment was not found"))
+}
+
+fn vault_enrollment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultEnrollment> {
+    Ok(VaultEnrollment {
+        id: row.get(0)?,
+        device_name: row.get(1)?,
+        public_key_algorithm: row.get(2)?,
+        public_key_der_base64: row.get(3)?,
+        status: row.get(4)?,
+        encrypted_secret_base64: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        approved_at: row.get(8)?,
+    })
 }
 
 fn broadcast_sync_revisions(
