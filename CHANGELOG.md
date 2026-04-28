@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0-beta.12 - 2026-04-28
+
+- Store and signal the `dtach` process id for session deletion without moving
+  direct SSH attachments into a background process group.
+
 ## 0.5.0-beta.11 - 2026-04-28
 
 - Added the authenticated `DELETE /api/sessions/{id}` endpoint so Portal and

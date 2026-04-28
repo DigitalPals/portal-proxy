@@ -231,6 +231,8 @@ struct SessionMetadata {
     ended_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_group_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_id: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1411,6 +1413,9 @@ fn delete_session(state_dir: &std::path::Path, session_id: Uuid) -> Result<bool>
         if let Some(process_group_id) = metadata.process_group_id {
             process_signaled = signal_process_group(process_group_id)?;
             thread::sleep(Duration::from_millis(100));
+        } else if let Some(process_id) = metadata.process_id {
+            process_signaled = signal_process(process_id)?;
+            thread::sleep(Duration::from_millis(100));
         }
         remove_file_if_exists(&socket_path)?;
     }
@@ -1419,6 +1424,7 @@ fn delete_session(state_dir: &std::path::Path, session_id: Uuid) -> Result<bool>
     metadata.updated_at = now;
     metadata.ended_at = Some(now);
     metadata.process_group_id = None;
+    metadata.process_id = None;
     save_session_metadata(state_dir, &metadata)?;
 
     Ok(process_signaled)
@@ -1473,6 +1479,30 @@ fn signal_process_group(process_group_id: i32) -> Result<bool> {
         bail!(
             "failed to signal session process group {}: {}",
             process_group_id,
+            stderr.trim()
+        );
+    }
+    Ok(true)
+}
+
+fn signal_process(process_id: i32) -> Result<bool> {
+    if process_id <= 0 {
+        bail!("invalid session process id {}", process_id);
+    }
+    let output = Command::new("kill")
+        .arg("-TERM")
+        .arg("--")
+        .arg(process_id.to_string())
+        .output()
+        .context("failed to signal session process")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("No such process") {
+            return Ok(false);
+        }
+        bail!(
+            "failed to signal session process {}: {}",
+            process_id,
             stderr.trim()
         );
     }
@@ -2953,6 +2983,7 @@ mod tests {
             updated_at: now,
             ended_at: None,
             process_group_id: None,
+            process_id: None,
         };
         save_session_metadata(&state_dir, &metadata).unwrap();
         std::fs::write(sessions_socket_path(&state_dir, session_id), b"").unwrap();
@@ -2966,6 +2997,7 @@ mod tests {
         assert!(!signaled);
         assert!(metadata.ended_at.is_some());
         assert!(metadata.process_group_id.is_none());
+        assert!(metadata.process_id.is_none());
         assert!(!sessions_socket_path(&state_dir, session_id).exists());
     }
 

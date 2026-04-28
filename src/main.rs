@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -202,6 +202,8 @@ struct SessionMetadata {
     ended_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_group_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_id: Option<i32>,
 }
 
 fn default_metadata_schema_version() -> u16 {
@@ -666,6 +668,7 @@ fn attach_session(state: &State, request: AttachRequest) -> Result<()> {
             existing.updated_at = now;
             existing.ended_at = None;
             existing.process_group_id = None;
+            existing.process_id = None;
             existing
         })
         .unwrap_or(SessionMetadata {
@@ -679,6 +682,7 @@ fn attach_session(state: &State, request: AttachRequest) -> Result<()> {
             updated_at: now,
             ended_at: None,
             process_group_id: None,
+            process_id: None,
         });
     state.save_session(&metadata)?;
 
@@ -699,7 +703,6 @@ fn attach_session(state: &State, request: AttachRequest) -> Result<()> {
     );
 
     let mut command = Command::new("dtach");
-    command.process_group(0);
     command.arg("-A").arg(&socket_path).arg("-r").arg("winch");
 
     match logging_mode {
@@ -725,9 +728,9 @@ fn attach_session(state: &State, request: AttachRequest) -> Result<()> {
         .stderr(Stdio::inherit())
         .spawn()
         .context("failed to start dtach")?;
-    let process_group_id = i32::try_from(child.id()).ok();
+    let process_id = i32::try_from(child.id()).ok();
     let mut metadata = metadata;
-    metadata.process_group_id = process_group_id;
+    metadata.process_id = process_id;
     metadata.updated_at = Utc::now();
     state.save_session(&metadata)?;
 
@@ -747,6 +750,7 @@ fn attach_session(state: &State, request: AttachRequest) -> Result<()> {
     };
     if updated.ended_at.is_some() {
         updated.process_group_id = None;
+        updated.process_id = None;
     }
     if logging_mode == LoggingMode::Full && updated.ended_at.is_some() && max_log_bytes > 0 {
         truncate_log_to_tail(&log_path, max_log_bytes)?;
@@ -1673,6 +1677,7 @@ mod tests {
             updated_at: ended_at.unwrap_or(now),
             ended_at,
             process_group_id: None,
+            process_id: None,
         }
     }
 
