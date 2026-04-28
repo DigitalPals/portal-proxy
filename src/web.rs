@@ -2932,19 +2932,19 @@ mod tests {
     #[test]
     fn public_url_is_canonicalized_to_origin() {
         assert_eq!(
-            canonicalize_public_url("https://portal-hub.risk-bull.ts.net/").unwrap(),
-            "https://portal-hub.risk-bull.ts.net"
+            canonicalize_public_url("https://portal-hub.example.ts.net/").unwrap(),
+            "https://portal-hub.example.ts.net"
         );
         assert_eq!(
-            canonicalize_public_url("https://portal-hub.risk-bull.ts.net:8443/path?x=1").unwrap(),
-            "https://portal-hub.risk-bull.ts.net:8443"
+            canonicalize_public_url("https://portal-hub.example.ts.net:8443/path?x=1").unwrap(),
+            "https://portal-hub.example.ts.net:8443"
         );
     }
 
     #[test]
     fn public_url_rejects_non_http_urls() {
-        assert!(canonicalize_public_url("portal-hub.risk-bull.ts.net").is_err());
-        assert!(canonicalize_public_url("ssh://portal-hub.risk-bull.ts.net").is_err());
+        assert!(canonicalize_public_url("portal-hub.example.ts.net").is_err());
+        assert!(canonicalize_public_url("ssh://portal-hub.example.ts.net").is_err());
     }
 
     #[test]

@@ -237,7 +237,7 @@ PORTAL_HUB_STATE_DIR=/var/lib/portal-hub
 PORTAL_HUB_PUBLIC_URL=https://portal-hub.example.ts.net
 PORTAL_HUB_MAX_LOG_BYTES=16777216
 PORTAL_HUB_LOGGING_MODE=full
-PORTAL_HUB_ALLOWED_TARGETS=*.internal,10.10.0.0/16
+PORTAL_HUB_ALLOWED_TARGETS=*.internal,192.0.2.0/24
 ```
 
 `PORTAL_HUB_ALLOWED_TARGETS` supports exact hostnames, `*` wildcard patterns,

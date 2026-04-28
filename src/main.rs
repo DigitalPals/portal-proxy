@@ -1704,7 +1704,7 @@ mod tests {
             Path::new("/tmp/portal known_hosts"),
             2222,
             "root",
-            "10.10.0.6",
+            "192.0.2.6",
             None,
             true,
         );
@@ -1931,8 +1931,8 @@ mod tests {
     fn target_allowlist_supports_exact_wildcard_and_cidr() {
         assert!(target_pattern_matches("example.com", "example.com"));
         assert!(target_pattern_matches("*.internal", "db.internal"));
-        assert!(target_pattern_matches("10.10.0.0/16", "10.10.0.206"));
-        assert!(!target_pattern_matches("10.10.0.0/24", "10.10.1.2"));
+        assert!(target_pattern_matches("192.0.2.0/24", "192.0.2.206"));
+        assert!(!target_pattern_matches("192.0.2.0/24", "192.0.3.2"));
     }
 
     #[test]

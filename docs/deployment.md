@@ -223,7 +223,7 @@ Install the example systemd timer from `examples/systemd` to run pruning daily.
 For shared proxy hosts, restrict which target hosts Portal Hub may connect to:
 
 ```text
-PORTAL_HUB_ALLOWED_TARGETS=*.internal,10.10.0.0/16
+PORTAL_HUB_ALLOWED_TARGETS=*.internal,192.0.2.0/24
 ```
 
 Patterns support exact hostnames, `*` wildcards, and IP CIDR ranges.
