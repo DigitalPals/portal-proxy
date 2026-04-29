@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0-beta.14 - 2026-04-29
+
+- Added Android QR pairing for vault access.
+- Added Android vault enrollment lifecycle APIs and event notifications.
+- Added cross-repository contract and pairing smoke checks.
+- Documented the Portal Hub LXC staging target for human release validation.
+
 ## 0.5.0-beta.12 - 2026-04-28
 
 - Store and signal the `dtach` process id for session deletion without moving

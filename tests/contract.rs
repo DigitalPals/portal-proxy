@@ -67,7 +67,7 @@ fn api_info_response_contract_matches_hub_capabilities() {
         "api-info-response",
         json!({
             "api_version": 2,
-            "version": "0.5.0-beta.13",
+            "version": "0.5.0-beta.14",
             "public_url": "https://portal-hub.example.ts.net",
             "capabilities": {
                 "sync_v2": true,
@@ -84,7 +84,7 @@ fn api_info_response_contract_matches_hub_capabilities() {
         "api-info-response",
         json!({
             "api_version": 1,
-            "version": "0.5.0-beta.13",
+            "version": "0.5.0-beta.14",
             "public_url": "https://portal-hub.example.ts.net",
             "capabilities": {},
             "ssh_port": 2222,
