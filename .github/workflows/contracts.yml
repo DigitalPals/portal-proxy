@@ -40,3 +40,6 @@ jobs:
 
       - name: Run ecosystem contract checks
         run: ./portal-hub/scripts/check-ecosystem-contracts.sh
+
+      - name: Run Android pairing smoke checks
+        run: ./portal-hub/scripts/check-android-pairing-flow.sh

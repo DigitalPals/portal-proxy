@@ -3006,6 +3006,73 @@ mod tests {
     }
 
     #[test]
+    fn android_vault_pairing_flow_smoke() {
+        let state = test_state();
+        register_inner(
+            &state,
+            RegisterRequest {
+                username: "owner".to_string(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
+        .unwrap();
+        let user_id: String = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT id FROM users WHERE username = 'owner'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        let pairing_link = android_pairing_link(&state.public_url);
+        assert!(pairing_link.starts_with("com.digitalpals.portal.android:/pair?hub_url="));
+
+        let enrollment = create_vault_enrollment(
+            &state,
+            &user_id,
+            VaultEnrollmentCreateRequest {
+                device_name: "Pixel Smoke Test".to_string(),
+                public_key_algorithm: "RSA-OAEP-SHA256".to_string(),
+                public_key_der_base64: BASE64_STANDARD.encode(b"public-key-der"),
+            },
+        )
+        .unwrap();
+        assert_eq!(enrollment.status, "pending");
+        assert!(enrollment.encrypted_secret_base64.is_none());
+
+        let pending = list_vault_enrollments(&state, &user_id, Some("pending")).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, enrollment.id);
+
+        let approved = approve_vault_enrollment(
+            &state,
+            &user_id,
+            &enrollment.id,
+            VaultEnrollmentApproveRequest {
+                encrypted_secret_base64: BASE64_STANDARD.encode(b"encrypted-vault-secret"),
+            },
+        )
+        .unwrap();
+        assert_eq!(approved.status, "approved");
+        assert_eq!(
+            approved.encrypted_secret_base64.as_deref(),
+            Some(BASE64_STANDARD.encode(b"encrypted-vault-secret").as_str())
+        );
+        assert!(approved.approved_at.is_some());
+
+        assert!(
+            list_vault_enrollments(&state, &user_id, Some("pending"))
+                .unwrap()
+                .is_empty()
+        );
+        let loaded = load_vault_enrollment(&state, &user_id, &enrollment.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, "approved");
+    }
+
+    #[test]
     fn android_oauth_rejects_loopback_redirect() {
         let mut query = test_oauth();
         query.client_id = ANDROID_CLIENT_ID.to_string();
