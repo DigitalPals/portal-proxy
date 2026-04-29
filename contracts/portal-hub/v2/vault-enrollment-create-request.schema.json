@@ -7,7 +7,13 @@
   "properties": {
     "device_name": { "type": "string", "minLength": 1 },
     "public_key_algorithm": { "const": "RSA-OAEP-SHA256" },
-    "public_key_der_base64": { "type": "string", "minLength": 1 }
+    "public_key_der_base64": { "type": "string", "minLength": 1 },
+    "pairing_id": {
+      "anyOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ]
+    }
   },
   "additionalProperties": false
 }

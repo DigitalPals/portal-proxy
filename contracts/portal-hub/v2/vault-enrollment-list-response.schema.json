@@ -12,17 +12,25 @@
       "public_key_der_base64",
       "status",
       "encrypted_secret_base64",
+      "pairing_id",
       "created_at",
       "updated_at",
-      "approved_at"
+      "approved_at",
+      "revoked_at"
     ],
     "properties": {
       "id": { "type": "string", "format": "uuid" },
       "device_name": { "type": "string", "minLength": 1 },
       "public_key_algorithm": { "const": "RSA-OAEP-SHA256" },
       "public_key_der_base64": { "type": "string", "minLength": 1 },
-      "status": { "enum": ["pending", "approved", "rejected", "expired"] },
+      "status": { "enum": ["pending", "approved", "rejected", "expired", "revoked"] },
       "encrypted_secret_base64": {
+        "anyOf": [
+          { "type": "string" },
+          { "type": "null" }
+        ]
+      },
+      "pairing_id": {
         "anyOf": [
           { "type": "string" },
           { "type": "null" }
@@ -31,6 +39,12 @@
       "created_at": { "type": "string", "format": "date-time" },
       "updated_at": { "type": "string", "format": "date-time" },
       "approved_at": {
+        "anyOf": [
+          { "type": "string", "format": "date-time" },
+          { "type": "null" }
+        ]
+      },
+      "revoked_at": {
         "anyOf": [
           { "type": "string", "format": "date-time" },
           { "type": "null" }

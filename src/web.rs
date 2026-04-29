@@ -67,6 +67,7 @@ struct AppState {
     public_url: String,
     ssh_port: u16,
     sync_events: broadcast::Sender<SyncRevisionEvent>,
+    vault_events: broadcast::Sender<VaultEnrollmentEvent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +75,8 @@ struct VaultEnrollmentCreateRequest {
     device_name: String,
     public_key_algorithm: String,
     public_key_der_base64: String,
+    #[serde(default)]
+    pairing_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +89,11 @@ struct VaultEnrollmentListQuery {
     status: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AuditListQuery {
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct VaultEnrollment {
     id: String,
@@ -94,9 +102,18 @@ struct VaultEnrollment {
     public_key_der_base64: String,
     status: String,
     encrypted_secret_base64: Option<String>,
+    pairing_id: Option<String>,
     created_at: String,
     updated_at: String,
     approved_at: Option<String>,
+    revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VaultAuditEvent {
+    timestamp: String,
+    event: String,
+    detail: Value,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -176,6 +193,13 @@ struct SyncServiceState {
 struct SyncRevisionEvent {
     user_id: String,
     services: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct VaultEnrollmentEvent {
+    user_id: String,
+    enrollment_id: String,
+    enrollment: VaultEnrollment,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,12 +305,14 @@ async fn run_async(
         }
     };
     let (sync_events, _) = broadcast::channel(256);
+    let (vault_events, _) = broadcast::channel(256);
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         state_dir,
         public_url,
         ssh_port,
         sync_events,
+        vault_events,
     };
 
     let app = Router::new()
@@ -309,10 +335,19 @@ async fn run_async(
             "/api/vault/enrollments",
             get(api_vault_enrollments).post(api_vault_enrollment_create),
         )
+        .route("/api/vault/enrollments/audit", get(api_vault_audit_events))
         .route("/api/vault/enrollments/:id", get(api_vault_enrollment_get))
+        .route(
+            "/api/vault/enrollments/:id/events",
+            get(api_vault_enrollment_events),
+        )
         .route(
             "/api/vault/enrollments/:id/approve",
             post(api_vault_enrollment_approve),
+        )
+        .route(
+            "/api/vault/enrollments/:id/revoke",
+            post(api_vault_enrollment_revoke),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -384,14 +419,24 @@ fn init_db(db: &Connection) -> Result<()> {
             public_key_algorithm TEXT NOT NULL,
             public_key_der_base64 TEXT NOT NULL,
             encrypted_secret_base64 TEXT,
+            pairing_id TEXT,
             status TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            approved_at TEXT
+            approved_at TEXT,
+            revoked_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS android_pairing_sessions (
+            id TEXT PRIMARY KEY,
+            public_url TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT
         );
         "#,
     )?;
     ensure_password_hash_column(db)?;
+    ensure_vault_enrollment_columns(db)?;
     Ok(())
 }
 
@@ -409,7 +454,7 @@ async fn root(State(state): State<AppState>) -> Response {
                     {}
                   </section>"#,
                 html_escape(&state.public_url),
-                android_pairing_panel(&state.public_url)
+                android_pairing_panel(&state)
             ),
         ))
         .into_response()
@@ -457,7 +502,7 @@ async fn admin_page(
                 {}
               </section>"#,
                 continue_button_html(&continue_url),
-                android_pairing_panel(&state.public_url)
+                android_pairing_panel(&state)
             ),
         ))
         .into_response();
@@ -517,7 +562,7 @@ async fn android_pairing_page(State(state): State<AppState>) -> Response {
                 <p class="lead">Scan this QR code on Android to select this Hub, sign in, and request vault access automatically.</p>
                 {}
               </section>"#,
-            android_pairing_panel(&state.public_url)
+            android_pairing_panel(&state)
         ),
     ))
     .into_response()
@@ -809,7 +854,9 @@ async fn api_info(State(state): State<AppState>) -> Response {
             "sync_events": true,
             "web_proxy": true,
             "key_vault": true,
-            "vault_enrollment": true
+            "vault_enrollment": true,
+            "vault_enrollment_events": true,
+            "android_pairing_sessions": true
         },
         "ssh_port": state.ssh_port,
         "ssh_username": "portal-hub",
@@ -1386,6 +1433,74 @@ async fn api_vault_enrollment_approve(
     }
 }
 
+async fn api_vault_enrollment_revoke(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match revoke_vault_enrollment(&state, &user_id, &id) {
+        Ok(enrollment) => Json(enrollment).into_response(),
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn api_vault_enrollment_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let initial = match load_vault_enrollment(&state, &user_id, &id) {
+        Ok(Some(enrollment)) => once(Ok::<Event, Infallible>(
+            vault_enrollment_event(&enrollment)
+                .unwrap_or_else(|error| error_event(error.to_string())),
+        )),
+        Ok(None) => {
+            return json_error(StatusCode::NOT_FOUND, anyhow!("vault enrollment not found"));
+        }
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let updates = BroadcastStream::new(state.vault_events.subscribe()).filter_map(move |event| {
+        let user_id = user_id.clone();
+        let id = id.clone();
+        async move {
+            match event {
+                Ok(event) if event.user_id == user_id && event.enrollment_id == id => {
+                    Some(Ok(vault_enrollment_event(&event.enrollment)
+                        .unwrap_or_else(|error| error_event(error.to_string()))))
+                }
+                Ok(_) => None,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => None,
+            }
+        }
+    });
+    Sse::new(initial.chain(updates))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn api_vault_audit_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditListQuery>,
+) -> Response {
+    let (user_id, _) = match authenticated_user(&state, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match list_vault_audit_events(&state, &user_id, query.limit.unwrap_or(50)) {
+        Ok(events) => Json(json!({"events": events})).into_response(),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
 fn listed_sessions(
     state_dir: &std::path::Path,
     query: SessionsQuery,
@@ -1850,6 +1965,9 @@ fn create_vault_enrollment(
     BASE64_STANDARD
         .decode(request.public_key_der_base64.as_bytes())
         .context("public_key_der_base64 is not valid base64")?;
+    if let Some(pairing_id) = request.pairing_id.as_deref() {
+        consume_android_pairing_session(state, pairing_id)?;
+    }
 
     let now = Utc::now().to_rfc3339();
     let enrollment = VaultEnrollment {
@@ -1859,9 +1977,11 @@ fn create_vault_enrollment(
         public_key_der_base64: request.public_key_der_base64,
         status: "pending".to_string(),
         encrypted_secret_base64: None,
+        pairing_id: request.pairing_id,
         created_at: now.clone(),
         updated_at: now,
         approved_at: None,
+        revoked_at: None,
     };
     let db = state
         .db
@@ -1869,14 +1989,15 @@ fn create_vault_enrollment(
         .map_err(|_| anyhow!("database lock poisoned"))?;
     db.execute(
         "INSERT INTO vault_enrollments
-         (id, user_id, device_name, public_key_algorithm, public_key_der_base64, encrypted_secret_base64, status, created_at, updated_at, approved_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, NULL)",
+         (id, user_id, device_name, public_key_algorithm, public_key_der_base64, encrypted_secret_base64, pairing_id, status, created_at, updated_at, approved_at, revoked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, NULL, NULL)",
         params![
             enrollment.id,
             user_id,
             enrollment.device_name,
             enrollment.public_key_algorithm,
             enrollment.public_key_der_base64,
+            enrollment.pairing_id,
             enrollment.status,
             enrollment.created_at,
             enrollment.updated_at,
@@ -1891,6 +2012,34 @@ fn create_vault_enrollment(
     Ok(enrollment)
 }
 
+fn consume_android_pairing_session(state: &AppState, pairing_id: &str) -> Result<()> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    let Some((expires_at, consumed_at)) = db
+        .query_row(
+            "SELECT expires_at, consumed_at FROM android_pairing_sessions WHERE id = ?1",
+            [pairing_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+    else {
+        bail!("pairing session was not found");
+    };
+    if consumed_at.is_some() {
+        bail!("pairing session was already used");
+    }
+    if DateTime::parse_from_rfc3339(&expires_at)?.with_timezone(&Utc) < Utc::now() {
+        bail!("pairing session expired");
+    }
+    db.execute(
+        "UPDATE android_pairing_sessions SET consumed_at = ?1 WHERE id = ?2",
+        params![Utc::now().to_rfc3339(), pairing_id],
+    )?;
+    Ok(())
+}
+
 fn list_vault_enrollments(
     state: &AppState,
     user_id: &str,
@@ -1901,14 +2050,28 @@ fn list_vault_enrollments(
         .db
         .lock()
         .map_err(|_| anyhow!("database lock poisoned"))?;
-    let mut stmt = db.prepare(
-        "SELECT id, device_name, public_key_algorithm, public_key_der_base64, status,
-                encrypted_secret_base64, created_at, updated_at, approved_at
-         FROM vault_enrollments
-         WHERE user_id = ?1 AND status = ?2
-         ORDER BY created_at DESC",
-    )?;
-    let rows = stmt.query_map(params![user_id, status], vault_enrollment_from_row)?;
+    let mut stmt = if status == "all" {
+        db.prepare(
+            "SELECT id, device_name, public_key_algorithm, public_key_der_base64, status,
+                    encrypted_secret_base64, pairing_id, created_at, updated_at, approved_at, revoked_at
+             FROM vault_enrollments
+             WHERE user_id = ?1
+             ORDER BY created_at DESC",
+        )?
+    } else {
+        db.prepare(
+            "SELECT id, device_name, public_key_algorithm, public_key_der_base64, status,
+                    encrypted_secret_base64, pairing_id, created_at, updated_at, approved_at, revoked_at
+             FROM vault_enrollments
+             WHERE user_id = ?1 AND status = ?2
+             ORDER BY created_at DESC",
+        )?
+    };
+    let rows = if status == "all" {
+        stmt.query_map(params![user_id], vault_enrollment_from_row)?
+    } else {
+        stmt.query_map(params![user_id, status], vault_enrollment_from_row)?
+    };
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
@@ -1923,7 +2086,7 @@ fn load_vault_enrollment(
         .map_err(|_| anyhow!("database lock poisoned"))?;
     db.query_row(
         "SELECT id, device_name, public_key_algorithm, public_key_der_base64, status,
-                encrypted_secret_base64, created_at, updated_at, approved_at
+                encrypted_secret_base64, pairing_id, created_at, updated_at, approved_at, revoked_at
          FROM vault_enrollments
          WHERE user_id = ?1 AND id = ?2",
         params![user_id, id],
@@ -1966,8 +2129,68 @@ fn approve_vault_enrollment(
         json!({"enrollment_id": id}),
     )?;
     drop(db);
-    load_vault_enrollment(state, user_id, id)?
-        .ok_or_else(|| anyhow!("vault enrollment was not found"))
+    let enrollment = load_vault_enrollment(state, user_id, id)?
+        .ok_or_else(|| anyhow!("vault enrollment was not found"))?;
+    broadcast_vault_enrollment(state, user_id, &enrollment);
+    Ok(enrollment)
+}
+
+fn revoke_vault_enrollment(state: &AppState, user_id: &str, id: &str) -> Result<VaultEnrollment> {
+    let existing = load_vault_enrollment(state, user_id, id)?
+        .ok_or_else(|| anyhow!("vault enrollment was not found"))?;
+    if existing.status == "revoked" {
+        return Ok(existing);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    db.execute(
+        "UPDATE vault_enrollments
+         SET status = 'revoked', encrypted_secret_base64 = NULL, updated_at = ?1, revoked_at = ?1
+         WHERE user_id = ?2 AND id = ?3",
+        params![now, user_id, id],
+    )?;
+    audit_db(
+        &db,
+        "vault_enrollment_revoke",
+        Some(user_id),
+        json!({"enrollment_id": id, "previous_status": existing.status}),
+    )?;
+    drop(db);
+    let enrollment = load_vault_enrollment(state, user_id, id)?
+        .ok_or_else(|| anyhow!("vault enrollment was not found"))?;
+    broadcast_vault_enrollment(state, user_id, &enrollment);
+    Ok(enrollment)
+}
+
+fn list_vault_audit_events(
+    state: &AppState,
+    user_id: &str,
+    limit: usize,
+) -> Result<Vec<VaultAuditEvent>> {
+    let limit = limit.clamp(1, 200) as i64;
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    let mut stmt = db.prepare(
+        "SELECT timestamp, event, detail FROM audit_events
+         WHERE user_id = ?1 AND event LIKE 'vault_enrollment_%'
+         ORDER BY id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![user_id, limit], |row| {
+        let detail: String = row.get(2)?;
+        Ok(VaultAuditEvent {
+            timestamp: row.get(0)?,
+            event: row.get(1)?,
+            detail: serde_json::from_str(&detail).unwrap_or_else(|_| json!({})),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 fn vault_enrollment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultEnrollment> {
@@ -1978,9 +2201,11 @@ fn vault_enrollment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultE
         public_key_der_base64: row.get(3)?,
         status: row.get(4)?,
         encrypted_secret_base64: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
-        approved_at: row.get(8)?,
+        pairing_id: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        approved_at: row.get(9)?,
+        revoked_at: row.get(10)?,
     })
 }
 
@@ -2009,6 +2234,22 @@ fn sync_event(services: HashMap<String, String>) -> Result<Event, serde_json::Er
         "services": services,
     }))
     .map(|data| Event::default().event("sync").data(data))
+}
+
+fn broadcast_vault_enrollment(state: &AppState, user_id: &str, enrollment: &VaultEnrollment) {
+    let _ = state.vault_events.send(VaultEnrollmentEvent {
+        user_id: user_id.to_string(),
+        enrollment_id: enrollment.id.clone(),
+        enrollment: enrollment.clone(),
+    });
+}
+
+fn vault_enrollment_event(enrollment: &VaultEnrollment) -> Result<Event, serde_json::Error> {
+    serde_json::to_string(&json!({
+        "type": "vault_enrollment",
+        "enrollment": enrollment,
+    }))
+    .map(|data| Event::default().event("vault_enrollment").data(data))
 }
 
 fn error_event(message: String) -> Event {
@@ -2255,15 +2496,41 @@ fn continue_button_html(continue_url: &str) -> String {
     )
 }
 
-fn android_pairing_link(public_url: &str) -> String {
-    format!(
-        "com.digitalpals.portal.android:/pair?hub_url={}",
-        urlencoding::encode(public_url)
-    )
+fn create_android_pairing_session(state: &AppState) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let created_at = Utc::now();
+    let expires_at = created_at + ChronoDuration::minutes(10);
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow!("database lock poisoned"))?;
+    db.execute(
+        "INSERT INTO android_pairing_sessions (id, public_url, created_at, expires_at, consumed_at)
+         VALUES (?1, ?2, ?3, ?4, NULL)",
+        params![
+            id,
+            state.public_url,
+            created_at.to_rfc3339(),
+            expires_at.to_rfc3339()
+        ],
+    )?;
+    Ok(id)
 }
 
-fn android_pairing_panel(public_url: &str) -> String {
-    let link = android_pairing_link(public_url);
+fn android_pairing_link(public_url: &str, pairing_id: Option<&str>) -> String {
+    let mut link = format!(
+        "com.digitalpals.portal.android:/pair?hub_url={}",
+        urlencoding::encode(public_url),
+    );
+    if let Some(pairing_id) = pairing_id {
+        write!(&mut link, "&pairing_id={}", urlencoding::encode(pairing_id)).ok();
+    }
+    link
+}
+
+fn android_pairing_panel(state: &AppState) -> String {
+    let pairing_id = create_android_pairing_session(state).ok();
+    let link = android_pairing_link(&state.public_url, pairing_id.as_deref());
     let qr_svg = QrCode::new(link.as_bytes())
         .map(|code| {
             code.render::<svg::Color<'_>>()
@@ -2277,7 +2544,7 @@ fn android_pairing_panel(public_url: &str) -> String {
             <div class="qr-code" aria-label="Portal Android pairing QR code">{}</div>
             <div class="pairing-copy">
               <strong>Portal Android</strong>
-              <p>Open this on your Android device. After sign-in, Portal Android creates a vault access request and waits for desktop approval.</p>
+              <p>Open this on your Android device. The pairing code expires in 10 minutes; after sign-in, Portal Android creates a vault access request and waits for desktop approval.</p>
               <a class="button-link compact" href="{}">Open Portal Android</a>
               <code>{}</code>
             </div>
@@ -2332,6 +2599,26 @@ fn ensure_password_hash_column(db: &Connection) -> Result<()> {
     if !user_table_has_column(db, "password_hash")? {
         db.execute(
             "ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_vault_enrollment_columns(db: &Connection) -> Result<()> {
+    let columns = db
+        .prepare("PRAGMA table_info(vault_enrollments)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "pairing_id") {
+        db.execute(
+            "ALTER TABLE vault_enrollments ADD COLUMN pairing_id TEXT",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|column| column == "revoked_at") {
+        db.execute(
+            "ALTER TABLE vault_enrollments ADD COLUMN revoked_at TEXT",
             [],
         )?;
     }
@@ -2928,12 +3215,14 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         init_db(&db).unwrap();
         let (sync_events, _) = broadcast::channel(16);
+        let (vault_events, _) = broadcast::channel(16);
         AppState {
             db: Arc::new(Mutex::new(db)),
             state_dir: std::env::temp_dir().join(format!("portal-hub-test-{}", Uuid::new_v4())),
             public_url: "http://portal-hub.localhost:8080".to_string(),
             ssh_port: 2222,
             sync_events,
+            vault_events,
         }
     }
 
@@ -2997,11 +3286,11 @@ mod tests {
 
     #[test]
     fn android_pairing_link_encodes_hub_url() {
-        let link = android_pairing_link("https://portal-hub.example.ts.net:8080");
+        let link = android_pairing_link("https://portal-hub.example.ts.net:8080", Some("pair-1"));
 
         assert_eq!(
             link,
-            "com.digitalpals.portal.android:/pair?hub_url=https%3A%2F%2Fportal-hub.example.ts.net%3A8080"
+            "com.digitalpals.portal.android:/pair?hub_url=https%3A%2F%2Fportal-hub.example.ts.net%3A8080&pairing_id=pair-1"
         );
     }
 
@@ -3025,7 +3314,8 @@ mod tests {
             })
             .unwrap();
 
-        let pairing_link = android_pairing_link(&state.public_url);
+        let pairing_id = create_android_pairing_session(&state).unwrap();
+        let pairing_link = android_pairing_link(&state.public_url, Some(&pairing_id));
         assert!(pairing_link.starts_with("com.digitalpals.portal.android:/pair?hub_url="));
 
         let enrollment = create_vault_enrollment(
@@ -3035,10 +3325,12 @@ mod tests {
                 device_name: "Pixel Smoke Test".to_string(),
                 public_key_algorithm: "RSA-OAEP-SHA256".to_string(),
                 public_key_der_base64: BASE64_STANDARD.encode(b"public-key-der"),
+                pairing_id: Some(pairing_id),
             },
         )
         .unwrap();
         assert_eq!(enrollment.status, "pending");
+        assert!(enrollment.pairing_id.is_some());
         assert!(enrollment.encrypted_secret_base64.is_none());
 
         let pending = list_vault_enrollments(&state, &user_id, Some("pending")).unwrap();
@@ -3061,6 +3353,10 @@ mod tests {
         );
         assert!(approved.approved_at.is_some());
 
+        let revoked = revoke_vault_enrollment(&state, &user_id, &enrollment.id).unwrap();
+        assert_eq!(revoked.status, "revoked");
+        assert!(revoked.revoked_at.is_some());
+
         assert!(
             list_vault_enrollments(&state, &user_id, Some("pending"))
                 .unwrap()
@@ -3069,7 +3365,7 @@ mod tests {
         let loaded = load_vault_enrollment(&state, &user_id, &enrollment.id)
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.status, "approved");
+        assert_eq!(loaded.status, "revoked");
     }
 
     #[test]
@@ -3197,12 +3493,14 @@ mod tests {
         .unwrap();
         init_db(&db).unwrap();
         let (sync_events, _) = broadcast::channel(16);
+        let (vault_events, _) = broadcast::channel(16);
         let state = AppState {
             db: Arc::new(Mutex::new(db)),
             state_dir: std::env::temp_dir().join(format!("portal-hub-test-{}", Uuid::new_v4())),
             public_url: "http://portal-hub.localhost:8080".to_string(),
             ssh_port: 2222,
             sync_events,
+            vault_events,
         };
 
         register_inner(

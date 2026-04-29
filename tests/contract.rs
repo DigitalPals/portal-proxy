@@ -235,16 +235,19 @@ fn vault_enrollment_contracts_cover_android_pairing_flow() {
         "public_key_der_base64": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A",
         "status": "pending",
         "encrypted_secret_base64": null,
+        "pairing_id": "00000000-0000-0000-0000-000000000010",
         "created_at": "2026-04-29T12:00:00Z",
         "updated_at": "2026-04-29T12:00:00Z",
-        "approved_at": null
+        "approved_at": null,
+        "revoked_at": null
     });
     assert_valid(
         "vault-enrollment-create-request",
         json!({
             "device_name": "Pixel",
             "public_key_algorithm": "RSA-OAEP-SHA256",
-            "public_key_der_base64": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A"
+            "public_key_der_base64": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A",
+            "pairing_id": "00000000-0000-0000-0000-000000000010"
         }),
     );
     assert_valid(
